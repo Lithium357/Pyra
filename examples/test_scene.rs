@@ -21,6 +21,7 @@ struct Tile {
 static TILES: OnceLock<Vec<Tile>> = OnceLock::new();
 static mut PHASE: f32 = 0.;
 static mut MOVING: bool = false;
+static mut REMAINING_TICKS: u32 = 0;
 fn wide(s: &str) -> Vec<u16> {
     s.encode_utf16().chain(Some(0)).collect()
 }
@@ -33,7 +34,7 @@ unsafe extern "system" fn proc(hwnd: HWND, msg: u32, w: WPARAM, l: LPARAM) -> LR
                 let mut rect = zeroed();
                 GetClientRect(hwnd, &mut rect);
                 FillRect(dc, &rect, GetStockObject(WHITE_BRUSH) as HBRUSH);
-                let title = wide("Pyra test: four face sizes. SPACE toggles motion. ESC closes.");
+                let title = wide("Pyra test: image suite. SPACE toggles motion. ESC closes.");
                 TextOutW(dc, 20, 15, title.as_ptr(), title.len() as i32 - 1);
                 let shift = (PHASE.sin() * 50.) as i32;
                 for tile in TILES.get().unwrap() {
@@ -69,6 +70,13 @@ unsafe extern "system" fn proc(hwnd: HWND, msg: u32, w: WPARAM, l: LPARAM) -> LR
                 return 0;
             }
             WM_TIMER => {
+                if REMAINING_TICKS > 0 {
+                    REMAINING_TICKS -= 1;
+                    if REMAINING_TICKS == 0 {
+                        DestroyWindow(hwnd);
+                        return 0;
+                    }
+                }
                 if MOVING {
                     PHASE += 0.08;
                     InvalidateRect(hwnd, null(), 0);
@@ -94,17 +102,30 @@ unsafe extern "system" fn proc(hwnd: HWND, msg: u32, w: WPARAM, l: LPARAM) -> LR
     }
 }
 fn main() -> anyhow::Result<()> {
-    let path = std::env::args()
-        .nth(1)
-        .ok_or_else(|| anyhow::anyhow!("provide reference image"))?;
-    let source = image::open(path)?.to_rgba8();
+    let args: Vec<_> = std::env::args().skip(1).collect();
+    let paths: Vec<_> = args.iter().filter(|a| !a.starts_with("--")).collect();
+    anyhow::ensure!(!paths.is_empty(), "provide reference images");
+    unsafe {
+        MOVING = args.iter().any(|a| a == "--animate");
+        if args.iter().any(|a| a == "--auto-close") {
+            REMAINING_TICKS = 1200;
+        }
+    }
     let mut tiles = Vec::new();
-    for (x, y, size) in [
-        (80, 60, 400),
-        (560, 60, 240),
-        (580, 400, 160),
-        (820, 420, 128),
-    ] {
+    let layout = if paths.len() == 1 {
+        vec![
+            (80, 60, 400),
+            (560, 60, 240),
+            (580, 400, 160),
+            (820, 420, 128),
+        ]
+    } else {
+        (0..paths.len().min(6))
+            .map(|i| (70 + (i % 3) as i32 * 320, 60 + (i / 3) as i32 * 290, 256))
+            .collect()
+    };
+    for (i, (x, y, size)) in layout.into_iter().enumerate() {
+        let source = image::open(paths[i % paths.len()])?.to_rgba8();
         let im =
             image::imageops::resize(&source, size, size, image::imageops::FilterType::Triangle);
         let pixels = im.pixels().flat_map(|p| [p[2], p[1], p[0], 255]).collect();

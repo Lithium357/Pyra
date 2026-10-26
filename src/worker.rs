@@ -1,12 +1,13 @@
 use crate::{
+    analysis::{Analyzer, Job},
     capture::{self, Capture, Monitor, WindowCache},
-    detection::{Bar, Detector, Region, suppress},
+    detection::{Bar, Image, Region},
     native::{self, IDLE, LIVE, Mapping, PAUSED, RECOVERING, STOP, Shared},
     overlay::Overlay,
     scanning::Scanner,
     tracking::Tracker,
 };
-use anyhow::Result;
+use anyhow::{Result, ensure};
 use std::{
     ptr::null_mut,
     sync::atomic::Ordering,
@@ -22,6 +23,8 @@ struct Screen {
     next_overview: Instant,
     next_face_check: Instant,
     face_cursor: usize,
+    scan_round: u64,
+    changed: bool,
     bars: Vec<Bar>,
 }
 impl Screen {
@@ -34,11 +37,13 @@ impl Screen {
             next_overview: Instant::now(),
             next_face_check: Instant::now(),
             face_cursor: 0,
+            scan_round: 0,
+            changed: true,
             bars: Vec::new(),
         })
     }
 }
-fn face_region(f: &crate::detection::Face, w: usize, h: usize) -> Region {
+pub(crate) fn face_region(f: &crate::detection::Face, w: usize, h: usize) -> Region {
     let x = (f.x - f.w * 0.35).floor().clamp(0., w as f32 - 1.) as usize;
     let y = (f.y - f.h * 0.35).floor().clamp(0., h as f32 - 1.) as usize;
     let r = (f.x + f.w * 1.35).ceil().clamp(x as f32 + 1., w as f32) as usize;
@@ -55,7 +60,11 @@ pub fn run(name: &str) -> Result<()> {
     let shared = mapping.shared();
     shared.heartbeat.store(native::tick(), Ordering::Relaxed);
     native::log("worker initializing");
-    let mut detector = Detector::new(&native::runtime())?;
+    let analyzer = Analyzer::new()?;
+    let mut inflight: Option<Instant> = None;
+    let mut reusable_pixels: Option<Vec<u8>> = None;
+    let mut generation = 0u64;
+    let mut screen_cursor = 0usize;
     let mut screens: Vec<Screen> = Vec::new();
     let mut topology = Vec::new();
     let mut handles = Vec::new();
@@ -92,6 +101,7 @@ pub fn run(name: &str) -> Result<()> {
         if start >= next_displays {
             let monitors = capture::monitors()?;
             if monitors != topology {
+                generation = generation.wrapping_add(1);
                 Shared::write(&shared.status, RECOVERING);
                 screens.clear();
                 all_bars.clear();
@@ -107,6 +117,14 @@ pub fn run(name: &str) -> Result<()> {
             next_displays = start + Duration::from_secs(2);
         }
         if flags & PAUSED != 0 {
+            if let Some(done) = analyzer.poll()? {
+                inflight = None;
+                reusable_pixels = Some(done.job.pixels);
+            }
+            ensure!(
+                inflight.is_none_or(|since| since.elapsed() < Duration::from_secs(5)),
+                "inference stalled while paused"
+            );
             if !was_paused {
                 for s in &mut screens {
                     s.overlay.paint(&[], true)?;
@@ -123,12 +141,14 @@ pub fn run(name: &str) -> Result<()> {
         let options_changed = (mode, threshold) != last_options || was_paused;
         was_paused = false;
         last_options = (mode, threshold);
-        let (total_ms, frame_ms, face_ms) = match mode {
-            1 => (52u64, 40, 90),
-            2 => (14, 100, 220),
-            _ => (30, 50, 120),
+        let (frame_ms, face_ms) = match mode {
+            1 => (40, 90),
+            2 => (100, 220),
+            _ => (50, 120),
         };
-        let budget = Duration::from_millis((total_ms / screens.len().max(1) as u64).max(10));
+        if options_changed {
+            generation = generation.wrapping_add(1);
+        }
         let mut count = 0;
         let mut any_change = false;
         window_cache.begin_frame();
@@ -145,56 +165,104 @@ pub fn run(name: &str) -> Result<()> {
             let image = s.capture.surface.image();
             let (changed, cut) = s.tracker.frame(&image, Instant::now());
             let tile_change = s.scanner.observe(&image, native::tick());
+            s.changed = changed || tile_change;
             any_change |= changed || tile_change;
-            let scan_start = Instant::now();
-            let mut found = Vec::new();
-            let mut checked = Vec::new();
-            if cut || (changed && scan_start >= s.next_overview) {
+            if cut {
+                generation = generation.wrapping_add(1);
+                s.next_overview = start;
+            }
+        }
+        if let Some(done) = analyzer.poll()? {
+            inflight = None;
+            let Job {
+                monitor,
+                generation: revision,
+                pixels,
+                region,
+                minimum,
+                tile,
+                captured,
+                ..
+            } = done.job;
+            if revision == generation
+                && captured.elapsed() < Duration::from_millis(750)
+                && let Some(s) = screens.iter_mut().find(|s| s.capture.monitor == monitor)
+            {
+                let source = Image {
+                    pixels: &pixels,
+                    width: monitor.w,
+                    height: monitor.h,
+                };
+                if let Some(found) = s.tracker.project(&source, done.faces) {
+                    s.tracker.verify(&found, region, minimum);
+                    s.tracker.update(found, Instant::now());
+                    if let Some((i, token)) = tile {
+                        s.scanner.completed(i, token, native::tick());
+                    }
+                }
+            }
+            reusable_pixels = Some(pixels);
+        }
+        ensure!(
+            inflight.is_none_or(|since| since.elapsed() < Duration::from_secs(5)),
+            "inference stalled"
+        );
+        if inflight.is_none() {
+            // Round-robin monitors and scan kinds so one animated window cannot
+            // monopolize inference. Capture/tracking never wait for this job.
+            for offset in 0..screens.len() {
+                let index = (screen_cursor + offset) % screens.len();
+                let s = &mut screens[index];
+                let m = s.capture.monitor;
                 let full = Region {
                     x: 0,
                     y: 0,
-                    w: image.width,
-                    h: image.height,
+                    w: m.w,
+                    h: m.h,
                 };
-                let faces = detector.detect(&image, full, threshold as f32 / 100.)?;
-                found.extend(faces);
-                checked.push((full, full.w.max(full.h) as f32 / 640. * 24.));
-                s.next_overview = Instant::now() + Duration::from_millis(500);
+                let overview = s.changed
+                    && start >= s.next_overview
+                    && (s.scan_round.is_multiple_of(3) || s.tracker.tracks.is_empty());
+                let roi = s.changed
+                    && !s.tracker.tracks.is_empty()
+                    && start >= s.next_face_check
+                    && s.scan_round % 3 == 1;
+                let selection = if overview {
+                    s.next_overview = start + Duration::from_millis(500);
+                    Some((full, full.w.max(full.h) as f32 / 640. * 24., None))
+                } else if roi {
+                    let i = s.face_cursor % s.tracker.tracks.len();
+                    s.face_cursor = s.face_cursor.wrapping_add(1);
+                    s.next_face_check = start + Duration::from_millis(face_ms);
+                    Some((face_region(&s.tracker.tracks[i].face, m.w, m.h), 0., None))
+                } else {
+                    s.scanner
+                        .next()
+                        .map(|(i, r)| (r, 0., Some((i, s.scanner.token(i)))))
+                };
+                if let Some((region, minimum, tile)) = selection {
+                    let mut pixels = reusable_pixels.take().unwrap_or_default();
+                    pixels.clear();
+                    pixels.extend_from_slice(s.capture.surface.pixels());
+                    analyzer.submit(Job {
+                        monitor: m,
+                        generation,
+                        pixels,
+                        region,
+                        minimum,
+                        tile,
+                        threshold: threshold as f32 / 100.,
+                        mode,
+                        captured: Instant::now(),
+                    })?;
+                    inflight = Some(Instant::now());
+                    s.scan_round = s.scan_round.wrapping_add(1);
+                    screen_cursor = (index + 1) % screens.len();
+                    break;
+                }
             }
-            // Local checks preserve landmark detail regardless of monitor shape.
-            if changed
-                && !s.tracker.tracks.is_empty()
-                && Instant::now() >= s.next_face_check
-                && scan_start.elapsed() < budget
-            {
-                let i = s.face_cursor % s.tracker.tracks.len();
-                let region = face_region(&s.tracker.tracks[i].face, image.width, image.height);
-                s.face_cursor = s.face_cursor.wrapping_add(1);
-                let faces = detector.detect(&image, region, threshold as f32 / 100.)?;
-                found.extend(faces);
-                checked.push((region, 0.));
-                s.next_face_check = Instant::now() + Duration::from_millis(face_ms);
-            }
-            let mut scans = 0;
-            // A pending tile stays pending until scanned. There is no fixed
-            // 280 ms wait between individual regions of an ultrawide monitor.
-            while (scans == 0 || scan_start.elapsed() < budget)
-                && let Some((i, region)) = s.scanner.next()
-            {
-                let faces = detector.detect(&image, region, threshold as f32 / 100.)?;
-                found.extend(faces);
-                checked.push((region, 0.));
-                s.scanner.scanned(i, native::tick());
-                scans += 1;
-                shared.heartbeat.store(native::tick(), Ordering::Relaxed);
-            }
-            // Resolve overlapping scales before touching tracks. Updating after
-            // every crop let the last, weaker crop overwrite better landmarks.
-            let found = suppress(found);
-            for (region, minimum) in checked {
-                s.tracker.verify(&found, region, minimum);
-            }
-            s.tracker.update(found, Instant::now());
+        }
+        for s in &mut screens {
             s.bars.clear();
             for track in &s.tracker.tracks {
                 let mut b = track.face.bar(

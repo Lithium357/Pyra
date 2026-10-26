@@ -5,6 +5,10 @@ it detects faces, tracks their motion, and draws tilted black bars through the
 eyes without clicking individual faces. The application is written in Rust.
 There is no Python runtime, browser shell, web service, or network code.
 
+Real faces use YuNet; anime and illustrated faces also use dedicated face and
+eye models. Bars follow detected eyes, including a single visible eye in a
+profile, rather than assuming the eyes occupy a fixed part of a face box.
+
 Every bar displays **[censored]** in white Doto text, centered and rotated with
 the bar. The font is embedded and loaded privately; no font installation or
 network access is needed. A reusable prefiltered label bitmap scales to fit
@@ -29,8 +33,8 @@ The tray menu offers:
 | Setting | Behavior |
 |---|---|
 | Balanced | Overlapping 800-pixel local regions, supplementary overview scans, and high-resolution checks of tracked faces; target 20 capture/tracking cycles/s. |
-| More detail | 640-pixel local regions and a larger inference time budget; target 25 cycles/s. |
-| Low power | 1280-pixel regions and a smaller inference budget; target 10 cycles/s. Small faces are more likely to be missed. |
+| More detail | 640-pixel local regions and 640-pixel anime inference; target 25 capture/tracking cycles/s. |
+| Low power | 1280-pixel regions and 384-pixel anime inference; target 10 capture/tracking cycles/s. Small faces are more likely to be missed. |
 | Sensitivity | Lower model confidence catches more faces, with more false positives. |
 | Bar width/thickness | Adjusts only the eye bar; never switches to full-face masks. |
 | Start when I sign in | Opt-in current-user startup entry. Disable before moving/deleting the portable folder. |
@@ -38,9 +42,14 @@ The tray menu offers:
 These are scheduling targets, not guaranteed frame rates. Multiple monitors,
 large windows, and busy screens increase cycle time. Per-region fingerprints
 keep changed regions pending until scanned, even if content immediately becomes
-still. A time budget processes multiple pending regions per cycle; an animation
-in one corner does not reset the whole display sweep. Stable regions are verified
-infrequently and unchanged overlay uploads are skipped.
+still. Inference runs on a separate thread, with one scan in flight and no frame
+backlog. Monitors and overview/local/face scans take turns. Detection positions
+are projected forward to the latest frame; obsolete results and scene cuts are
+discarded. Subpixel motion avoids cumulative rounding drift. Close-up landmarks
+survive coarse scans; duplicate boxes at different scales share one track.
+Stable regions are verified infrequently and unchanged overlay uploads
+are skipped. Balanced mode uses 512-pixel anime inference; small face checks use
+256 pixels. The models use up to two CPU inference threads without idle spinning.
 
 Ultrawide and portrait displays use local inference regions instead of depending
 on a whole display shrunk to 640 pixels. Tracking targets 480 pixels on the short
@@ -118,7 +127,8 @@ Download Microsoft's official
 The ZIP's SHA-256 is
 `174c616efc0271194488642a72f1a514e01487da4dfe84c49296d66e40ebe0da`.
 Copy the two DLLs from its `lib/` folder beside `target/release/pyra.exe`.
-The model is embedded in the executable from `models/yunet.onnx`.
+The three models are embedded from `models/`; see `models/PROVENANCE.md` for the
+anime models' exact versions, checksums, and published license metadata.
 Some systems may need Microsoft's Visual C++ 2015–2022 x64 Redistributable.
 
 Runtime loading uses an absolute DLL path beside the executable. For development
@@ -131,7 +141,13 @@ cargo clippy --all-targets --locked -- -D warnings
 cargo test --locked
 ```
 
-The optional desktop/model tests need an unlocked Windows desktop, the runtime
+The primary image-quality regression corpus covers anime/game art, profiles,
+glasses, multiple characters, no-face controls, dim/blurred/tilted variants, and
+nine annotated real group photos. CI fetches checksum-pinned fixtures and runs
+the Rust evaluation and real-time asynchronous motion tests. See
+[validation/README.md](validation/README.md) for metrics, sources and limitations.
+
+The legacy desktop/model tests need an unlocked Windows desktop, the runtime
 DLL, and the OpenCV reference `lena.jpg` (not distributed with this repo):
 
 ```powershell
@@ -184,10 +200,12 @@ running tray instance to exit cleanly. `--background` suppresses the startup tip
 | `native.rs` | Win32 tray/menu/hotkeys, settings, sign-in startup, shared state, Job Object and watchdog. |
 | `capture.rs` | Monitor enumeration, reusable BGRA capture, visible-region restoration beneath bars, and bounded accelerated window-render caches; RAII cleanup. |
 | `detection.rs` | Reusable bilinear BGR input tensor, YuNet inference/landmark decoding, NMS, detailed tiles, eye-bar geometry. |
+| `stylized.rs` | Native anime face/eye inference, RGB preprocessing, eye association and single-eye profiles. |
+| `analysis.rs` | Bounded inference thread; one job/result and no growing queue. |
 | `tracking.rs` | Sparse coarse/fine patch tracking with blurred coarse search, short missed-match persistence and scene-cut resets. |
 | `overlay.rs` | Reusable ARGB surfaces and capturable, transparent, topmost, click-through native windows. |
 | `scanning.rs` | Aspect-independent local grids, persistent per-region fingerprints, and fair pending scan selection. |
-| `worker.rs` | Budgeted scanning, local face checks, static-content suppression, topology/resource recovery and overlay updates. |
+| `worker.rs` | Fair asynchronous scan scheduling, source-frame projection, static-content suppression, topology/resource recovery and overlay updates. |
 
 GDI capture favors a small dependency footprint and straightforward recovery. It
 still copies screen pixels, and restoring hardware-accelerated windows adds work.

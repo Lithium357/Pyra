@@ -12,9 +12,26 @@ pub struct Face {
     pub h: f32,
     pub eyes: [[f32; 2]; 2],
     pub score: f32,
+    pub eye_count: u8,
+    /// Face width in the inference input, used to retain better local landmarks.
+    pub detail: f32,
+    pub eye_band: f32,
 }
 
 impl Face {
+    pub fn same_face(&self, other: &Self) -> bool {
+        let overlap = self.overlap(other);
+        if overlap >= 0.3 {
+            return true;
+        }
+        if overlap < 0.08 {
+            return false;
+        }
+        let a = self.bar(1., 1.);
+        let b = other.bar(1., 1.);
+        (a.x - b.x).abs() <= self.w.min(other.w) * 0.35
+            && (a.y - b.y).abs() <= self.h.min(other.h) * 0.25
+    }
     pub fn translate(&mut self, dx: f32, dy: f32) {
         self.x += dx;
         self.y += dy;
@@ -49,7 +66,11 @@ impl Face {
             x,
             y: (a[1] + b[1]) * 0.5,
             w: (self.w * 1.08).max(distance * 2.15).max(12.) * width,
-            h: (self.h * 0.24).max(distance * 0.52).max(7.) * thickness,
+            h: (self.h * 0.24)
+                .max(distance * 0.52)
+                .max(self.eye_band)
+                .max(7.)
+                * thickness,
             angle,
         }
     }
@@ -81,9 +102,13 @@ pub struct Region {
 pub struct Detector {
     session: Session,
     input: Vec<f32>,
+    stylized: crate::stylized::Stylized,
 }
 
 impl Detector {
+    pub fn set_mode(&mut self, mode: u32) {
+        self.stylized.set_mode(mode);
+    }
     pub fn new(runtime: &Path) -> Result<Self> {
         ort::init_from(runtime.display().to_string())
             .with_name("Pyra")
@@ -100,10 +125,32 @@ impl Detector {
         Ok(Self {
             session,
             input: vec![0.; 3 * INPUT * INPUT],
+            stylized: crate::stylized::Stylized::new()?,
         })
     }
 
     pub fn detect(
+        &mut self,
+        image: &Image<'_>,
+        region: Region,
+        threshold: f32,
+    ) -> Result<Vec<Face>> {
+        let human = self.detect_human(image, region, threshold)?;
+        // The eye detector, rather than an assumed fraction of an anime face
+        // rectangle, establishes the bar's position and tilt. Keep real-face
+        // results wherever the specialist has no confirmed eyes.
+        let mut found =
+            self.stylized
+                .detect(image, region, (threshold * 0.54).clamp(0.25, 0.55))?;
+        for face in human {
+            if found.iter().all(|art| !art.same_face(&face)) {
+                found.push(face);
+            }
+        }
+        Ok(suppress(found))
+    }
+
+    pub fn detect_human(
         &mut self,
         image: &Image<'_>,
         region: Region,
@@ -198,6 +245,9 @@ impl Detector {
                         h,
                         eyes,
                         score,
+                        eye_count: 2,
+                        detail: w * scale,
+                        eye_band: 0.,
                     });
                 }
             }
@@ -210,7 +260,7 @@ pub fn suppress(mut faces: Vec<Face>) -> Vec<Face> {
     faces.sort_unstable_by(|a, b| b.score.total_cmp(&a.score));
     let mut kept: Vec<Face> = Vec::new();
     for face in faces {
-        if kept.iter().all(|f| f.overlap(&face) < 0.3) {
+        if kept.iter().all(|f| !f.same_face(&face)) {
             kept.push(face);
         }
         if kept.len() >= 512 {
@@ -258,6 +308,9 @@ mod tests {
             h: 120.,
             eyes: [[35., 50.], [80., 65.]],
             score: 0.9,
+            eye_count: 2,
+            detail: 100.,
+            eye_band: 0.,
         };
         let b = f.bar(1., 1.);
         assert!(b.angle > 0.3 && b.angle < 0.4);
@@ -292,12 +345,21 @@ mod tests {
             h: 100.,
             eyes: [[25., 30.], [75., 30.]],
             score: 0.9,
+            eye_count: 2,
+            detail: 100.,
+            eye_band: 0.,
         };
         let mut duplicate = f.clone();
         duplicate.x = 3.;
         let mut second = f.clone();
         second.x = 150.;
-        assert_eq!(suppress(vec![f, duplicate, second]).len(), 2);
+        let mut nested = f.clone();
+        nested.x = 25.;
+        nested.y = 10.;
+        nested.w = 50.;
+        nested.h = 40.;
+        assert!(f.overlap(&nested) < 0.3);
+        assert_eq!(suppress(vec![f, duplicate, nested, second]).len(), 2);
     }
     #[test]
     #[ignore = "requires PYRA_RUNTIME and PYRA_TEST_IMAGE; see README"]

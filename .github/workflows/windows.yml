@@ -28,6 +28,7 @@ jobs:
           Copy-Item README.md,THIRD_PARTY.md dist/Pyra/
           Copy-Item LICENSE dist/Pyra/licenses/LICENSE-Pyra.txt
           Copy-Item models/LICENSE-YuNet.txt dist/Pyra/licenses/
+          Copy-Item models/LICENSE-DeepGHS.txt,models/MODEL-CARD-anime-eye.md,models/MODEL-CARD-anime-face.md,models/PROVENANCE.md dist/Pyra/licenses/
           Copy-Item assets/LICENSE-Doto.txt dist/Pyra/licenses/
           Copy-Item runtime/onnxruntime-win-x64-1.22.0/LICENSE dist/Pyra/licenses/LICENSE-ONNXRuntime.txt
           Copy-Item runtime/onnxruntime-win-x64-1.22.0/ThirdPartyNotices.txt dist/Pyra/licenses/ONNXRuntime-ThirdPartyNotices.txt
@@ -42,7 +43,28 @@ jobs:
               $licenseFiles | Copy-Item -Destination $destination
             }
           }
+      - name: Validate varied faces and asynchronous motion
+        shell: pwsh
+        run: |
+          Get-Content validation/sources.tsv | Where-Object { $_ -and -not $_.StartsWith('#') } | ForEach-Object {
+            $parts = $_.Split("`t")
+            $destination = Join-Path target/corpus $parts[0]
+            New-Item -ItemType Directory -Force (Split-Path $destination) | Out-Null
+            Invoke-WebRequest $parts[2] -OutFile $destination
+            if ((Get-FileHash $destination -Algorithm SHA256).Hash -ne $parts[1]) { throw "Fixture checksum mismatch: $($parts[0])" }
+          }
+          $env:PYRA_RUNTIME = (Resolve-Path dist/Pyra/onnxruntime.dll).Path
+          $env:PYRA_CORPUS = (Resolve-Path target/corpus/anime).Path
+          $env:PYRA_PHOTOS = (Resolve-Path target/corpus/dlib).Path
+          $env:PYRA_ART_MODELS = (Resolve-Path models).Path
+          $env:PYRA_REPORT = Join-Path (Get-Location) dist/validation
+          cargo test --release --locked --bin pyra validation:: -- --ignored --nocapture --test-threads=1
+          if ($LASTEXITCODE -ne 0) { throw 'Varied-image validation failed' }
       - uses: actions/upload-artifact@v4
         with:
           name: Pyra-windows-x64
           path: dist/Pyra/
+      - uses: actions/upload-artifact@v4
+        with:
+          name: Pyra-validation
+          path: dist/validation/

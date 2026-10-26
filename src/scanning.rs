@@ -92,6 +92,17 @@ impl Scanner {
         self.tiles[index].scanned = now.max(1);
         self.cursor = (index + 1) % self.tiles.len();
     }
+
+    pub fn token(&self, index: usize) -> Option<u64> {
+        self.tiles[index].fingerprint
+    }
+
+    pub fn completed(&mut self, index: usize, token: Option<u64>, now: u64) {
+        // An in-flight scan does not clear changes that happened afterwards.
+        let changed = self.tiles[index].fingerprint != token;
+        self.scanned(index, now);
+        self.tiles[index].dirty = changed;
+    }
 }
 
 fn fingerprint(image: &Image<'_>, r: Region) -> u64 {
@@ -113,6 +124,35 @@ fn fingerprint(image: &Image<'_>, r: Region) -> u64 {
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn in_flight_scan_cannot_erase_a_later_change() {
+        let mut pixels = vec![0; 100 * 100 * 4];
+        let mut scanner = Scanner::new(100, 100, 0);
+        scanner.observe(
+            &Image {
+                pixels: &pixels,
+                width: 100,
+                height: 100,
+            },
+            1,
+        );
+        let (index, _) = scanner.next().unwrap();
+        let token = scanner.token(index);
+        pixels.fill(255);
+        scanner.observe(
+            &Image {
+                pixels: &pixels,
+                width: 100,
+                height: 100,
+            },
+            2,
+        );
+        scanner.completed(index, token, 3);
+        assert!(scanner.next().is_some());
+        let token = scanner.token(index);
+        scanner.completed(index, token, 4);
+        assert!(scanner.next().is_none());
+    }
     #[test]
     fn a_single_changed_frame_stays_pending_until_scanned() {
         let mut scanner = Scanner::new(1600, 800, 0);
