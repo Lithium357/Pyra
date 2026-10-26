@@ -18,6 +18,7 @@ pub struct Overlay {
     surface: Surface,
     monitor: Monitor,
     previous: Vec<Bar>,
+    label: &'static crate::label::Label,
 }
 
 impl Overlay {
@@ -25,6 +26,7 @@ impl Overlay {
         self.hwnd
     }
     pub fn new(monitor: Monitor) -> Result<Self> {
+        let label = crate::label::Label::shared()?;
         static CLASS: OnceLock<u16> = OnceLock::new();
         let name = wide("Pyra.EyeOverlay");
         let instance = unsafe { GetModuleHandleW(null()) };
@@ -67,6 +69,7 @@ impl Overlay {
             surface,
             monitor,
             previous: vec![],
+            label,
         };
         out.paint(&[], true)?;
         Ok(out)
@@ -95,6 +98,7 @@ impl Overlay {
         let pixels = self.surface.pixels_mut();
         pixels.fill(0);
         for bar in bars {
+            let label = self.label.fit(bar.w, bar.h);
             let cx = bar.x - self.monitor.x as f32;
             let cy = bar.y - self.monitor.y as f32;
             let (s, c) = bar.angle.sin_cos();
@@ -108,10 +112,11 @@ impl Overlay {
                 let dy = y as f32 + 0.5 - cy;
                 for x in left..right {
                     let dx = x as f32 + 0.5 - cx;
-                    if (dx * c + dy * s).abs() <= bar.w * 0.5
-                        && (-dx * s + dy * c).abs() <= bar.h * 0.5
-                    {
-                        pixels[y * w + x] = 0xff000000;
+                    let local_x = dx * c + dy * s;
+                    let local_y = -dx * s + dy * c;
+                    if local_x.abs() <= bar.w * 0.5 && local_y.abs() <= bar.h * 0.5 {
+                        let shade = label.shade(local_x, local_y);
+                        pixels[y * w + x] = 0xff000000 | (shade * 0x00010101);
                     }
                 }
             }
@@ -224,11 +229,11 @@ mod tests {
             );
             let pixels = overlay.surface.pixels_mut();
             ensure!(
-                pixels[40 * m.w + 40] == 0xff000000,
+                pixels[40 * m.w + 40] >> 24 == 255,
                 "near-edge bar is misplaced"
             );
             ensure!(
-                pixels[(m.h - 40) * m.w + m.w - 40] == 0xff000000,
+                pixels[(m.h - 40) * m.w + m.w - 40] >> 24 == 255,
                 "far-edge bar is misplaced"
             );
             ensure!(
@@ -445,7 +450,8 @@ mod tests {
             DwmFlush();
             std::thread::sleep(std::time::Duration::from_millis(80));
             let mut capture = Capture::new(region)?;
-            let center = (60 * region.w + 120) * 4;
+            // Sample black padding away from the white centered label.
+            let center = (60 * region.w + 55) * 4;
             capture.grab_with_layers(true)?;
             let ordinary = capture.surface.pixels()[center..center + 3].to_vec();
             capture.grab_clean(
@@ -547,6 +553,46 @@ mod tests {
                 "GDI resources leaked: before={before} after={after}"
             );
             println!("25 overlay lifecycles: GDI handles before={before}, after={after}");
+            if let Some(path) = std::env::var_os("PYRA_TEST_OVERLAY_PREVIEW") {
+                let region = Monitor {
+                    x: monitor.x,
+                    y: monitor.y,
+                    w: 640,
+                    h: 240,
+                };
+                let mut overlay = Overlay::new(region)?;
+                overlay.paint(
+                    &[
+                        Bar {
+                            x: region.x as f32 + 320.,
+                            y: region.y as f32 + 65.,
+                            w: 560.,
+                            h: 65.,
+                            angle: 0.,
+                        },
+                        Bar {
+                            x: region.x as f32 + 195.,
+                            y: region.y as f32 + 170.,
+                            w: 270.,
+                            h: 42.,
+                            angle: -0.12,
+                        },
+                        Bar {
+                            x: region.x as f32 + 495.,
+                            y: region.y as f32 + 170.,
+                            w: 110.,
+                            h: 22.,
+                            angle: 0.18,
+                        },
+                    ],
+                    true,
+                )?;
+                let mut rgba = overlay.surface.pixels().to_vec();
+                for pixel in rgba.as_chunks_mut::<4>().0 {
+                    pixel.swap(0, 2);
+                }
+                image::save_buffer(path, &rgba, 640, 240, image::ColorType::Rgba8)?;
+            }
         }
         Ok(())
     }

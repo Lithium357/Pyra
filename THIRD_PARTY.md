@@ -4,6 +4,7 @@ The application code is Rust; native inference is supplied by ONNX Runtime.
 
 | Component | Purpose | License / upstream |
 |---|---|---|
+| Doto | Embedded unmodified font for the `[censored]` label | SIL Open Font License 1.1; `assets/LICENSE-Doto.txt`; https://github.com/google/fonts/tree/main/ofl/doto |
 | YuNet 2023mar | Face detector and eye landmarks, embedded unmodified | MIT, Shiqi Yu; `models/LICENSE-YuNet.txt`; https://github.com/opencv/opencv_zoo/tree/main/models/face_detection_yunet |
 | ONNX Runtime 1.22.0 | Native CPU inference via C ABI | MIT, Microsoft; https://github.com/microsoft/onnxruntime/tree/v1.22.0 |
 | ort / ort-sys 2.0.0-rc.10 | Rust bindings to ONNX Runtime | MIT OR Apache-2.0; https://github.com/pykeio/ort |

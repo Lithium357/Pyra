@@ -5,6 +5,11 @@ it detects faces, tracks their motion, and draws tilted black bars through the
 eyes without clicking individual faces. The application is written in Rust.
 There is no Python runtime, browser shell, web service, or network code.
 
+Every bar displays **[censored]** in white Doto text, centered and rotated with
+the bar. The font is embedded and loaded privately; no font installation or
+network access is needed. A reusable prefiltered label bitmap scales to fit
+each bar without changing its eye coverage. Very small bars have tiny labels.
+
 ## Run
 
 Windows 10 version 2004 (build 19041) or newer, or Windows 11; x64.

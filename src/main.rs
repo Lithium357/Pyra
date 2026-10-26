@@ -2,6 +2,7 @@
 
 mod capture;
 mod detection;
+mod label;
 mod native;
 mod overlay;
 mod scanning;
