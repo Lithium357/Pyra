@@ -246,6 +246,9 @@ mod tests {
             detection::{Detector, Region},
         };
         unsafe {
+            windows_sys::Win32::UI::HiDpi::SetProcessDpiAwarenessContext(
+                windows_sys::Win32::UI::HiDpi::DPI_AWARENESS_CONTEXT_PER_MONITOR_AWARE_V2,
+            );
             let hwnd = FindWindowW(
                 null(),
                 wide("Pyra browser coverage test - Google Chrome").as_ptr(),
@@ -287,13 +290,86 @@ mod tests {
             for tile in crate::scanning::grid(surface.w, surface.h, 800) {
                 detections.extend(detector.detect(&surface.image(), tile, 0.65)?);
             }
-            let rendered = crate::detection::suppress(detections).len();
+            let reference = crate::detection::suppress(detections);
+            let rendered = reference.len();
             println!(
                 "Chrome: window DC faces={gdi}; PrintWindow faces={rendered}; render={elapsed:?}; success={success}"
             );
             ensure!(
                 rendered == 4,
                 "browser render did not capture all four faces"
+            );
+            let monitor = Monitor {
+                x: rect.left,
+                y: rect.top,
+                w: surface.w,
+                h: surface.h,
+            };
+            let mut overlay = Overlay::new(monitor)?;
+            let mut capture = crate::capture::Capture::new(monitor)?;
+            let mut cache = crate::capture::WindowCache::default();
+            let mut tracker = crate::tracking::Tracker::default();
+            capture.grab()?;
+            tracker.frame(&capture.surface.image(), std::time::Instant::now());
+            tracker.update(reference.clone(), std::time::Instant::now());
+            let mut maximum_error = 0f32;
+            for frame in 0..60 {
+                let bars: Vec<_> = tracker
+                    .tracks
+                    .iter()
+                    .map(|t| {
+                        let mut bar = t.face.bar(1., 1.);
+                        bar.x += rect.left as f32;
+                        bar.y += rect.top as f32;
+                        bar
+                    })
+                    .collect();
+                overlay.paint(&bars, true)?;
+                std::thread::sleep(std::time::Duration::from_millis(20));
+                cache.begin_frame();
+                capture.grab_clean(&bars, &[overlay.handle()], &mut cache)?;
+                let image = capture.surface.image();
+                tracker.frame(&image, std::time::Instant::now());
+                if frame % 3 == 0 {
+                    let mut found = detector.detect(&image, full, 0.65)?;
+                    for tile in crate::scanning::grid(surface.w, surface.h, 800) {
+                        found.extend(detector.detect(&image, tile, 0.65)?);
+                    }
+                    tracker.update(crate::detection::suppress(found), std::time::Instant::now());
+                }
+                ensure!(
+                    tracker.tracks.len() == 4,
+                    "browser feedback lost a face at frame {frame}"
+                );
+                for expected in &reference {
+                    let actual = tracker
+                        .tracks
+                        .iter()
+                        .max_by(|a, b| {
+                            a.face
+                                .overlap(expected)
+                                .total_cmp(&b.face.overlap(expected))
+                        })
+                        .unwrap();
+                    let error = actual
+                        .face
+                        .eyes
+                        .iter()
+                        .zip(expected.eyes)
+                        .map(|(a, b)| (a[0] - b[0]).hypot(a[1] - b[1]))
+                        .fold(0f32, f32::max);
+                    maximum_error = maximum_error.max(error);
+                    if error > 4. {
+                        println!("reference={expected:?}; actual={:?}", actual.face);
+                    }
+                    ensure!(
+                        error <= 4.,
+                        "browser eye position drifted {error}px at frame {frame}"
+                    );
+                }
+            }
+            println!(
+                "60 browser feedback frames: four tracks throughout; maximum eye displacement={maximum_error:.2}px"
             );
         }
         Ok(())
@@ -363,6 +439,9 @@ mod tests {
                 angle: 0.,
             }];
             overlay.paint(&bars, true)?;
+            // A separate transparent utility overlay must not block access to
+            // the underlying window surface, even when absent from our list.
+            let _utility_overlay = Overlay::new(region)?;
             DwmFlush();
             std::thread::sleep(std::time::Duration::from_millis(80));
             let mut capture = Capture::new(region)?;
@@ -383,6 +462,36 @@ mod tests {
             ensure!(
                 detector == [255, 255, 255],
                 "detector sees its own bar: {detector:?}"
+            );
+            // Reproduce a video/window update between the desktop capture and
+            // the private reconstruction. The result must be one coherent new
+            // window frame, not a newer eye strip pasted into an older face.
+            capture.grab()?;
+            let brush = CreateSolidBrush(0x00808080);
+            let old = SetClassLongPtrW(backdrop, GCLP_HBRBACKGROUND, brush as isize);
+            InvalidateRect(backdrop, null(), 1);
+            UpdateWindow(backdrop);
+            DwmFlush();
+            let restored = capture.restore_overlay_areas(
+                &bars,
+                &[overlay.handle()],
+                &mut crate::capture::WindowCache::default(),
+            );
+            SetClassLongPtrW(backdrop, GCLP_HBRBACKGROUND, old as isize);
+            DeleteObject(brush);
+            restored?;
+            let mixed = capture
+                .surface
+                .pixels()
+                .as_chunks::<4>()
+                .0
+                .iter()
+                .filter(|p| p[..3] != [128, 128, 128])
+                .count();
+            println!("pixels from a mismatched window timestamp: {mixed}");
+            ensure!(
+                mixed == 0,
+                "capture spliced different window timestamps ({mixed} stale pixels)"
             );
         }
         Ok(())

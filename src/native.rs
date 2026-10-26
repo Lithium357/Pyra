@@ -572,7 +572,7 @@ impl Controller {
                 );
             },
             ID_ABOUT => unsafe {
-                MessageBoxW(self.hwnd, wide("Pyra 0.2.0\nLocal automatic eye bars across all displays.\n\nCtrl+Alt+B: pause/resume\nCtrl+Alt+O: tray menu\n\nNo screenshots are saved or uploaded.\nSmall/profile faces and fast cuts may be missed.\nUse borderless/windowed mode for fullscreen apps.\n\nRust + native Windows APIs + ONNX Runtime / YuNet.\nGPL-3.0. See README for testing and limits.").as_ptr(), wide("About Pyra").as_ptr(), MB_OK | MB_ICONINFORMATION);
+                MessageBoxW(self.hwnd, wide("Pyra 0.2.1\nLocal automatic eye bars across all displays.\n\nCtrl+Alt+B: pause/resume\nCtrl+Alt+O: tray menu\n\nNo screenshots are saved or uploaded.\nSmall/profile faces and fast cuts may be missed.\nUse borderless/windowed mode for fullscreen apps.\n\nRust + native Windows APIs + ONNX Runtime / YuNet.\nGPL-3.0. See README for testing and limits.").as_ptr(), wide("About Pyra").as_ptr(), MB_OK | MB_ICONINFORMATION);
             },
             _ => return,
         }

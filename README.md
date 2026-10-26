@@ -50,9 +50,10 @@ its physical rectangle after scaling or layout changes.
   no screenshots, facial identities, or video are saved. Diagnostic logs contain
   failures, startup/recovery events, and monitor dimensions, not images.
 - Bars are ordinary, capturable overlay windows: **desktop screenshots and
-  desktop recordings include them**. Pyra's detector privately restores only
-  their covered areas from underlying window surfaces, preserving foreground
-  occlusion. Hardware-accelerated browsers and common Qt/WPF applications use a
+  desktop recordings include them**. Pyra's detector privately replaces each
+  affected window's visible region from one coherent underlying window frame,
+  preserving foreground occlusion and looking through transparent click-through
+  utility overlays. Hardware-accelerated browsers and common Qt/WPF applications use a
   cached window-render fallback. Caches are shared across monitors and bounded
   to four reusable window bitmaps. No overlay is globally hidden from capture.
 - A capture of a specific application window can omit external overlay windows,
@@ -60,7 +61,9 @@ its physical rectangle after scaling or layout changes.
   This remains a best-effort live filter, not guaranteed irreversible redaction.
 - New faces can appear before a bar is placed. Small faces, profiles, obscured
   eyes, drawings, and fast video cuts can be missed. Tracking handles translation;
-  fresh landmark detections update tilt, scale, and facial movement.
+  fresh landmark detections update tilt, scale, and facial movement. Overlapping
+  scans are combined once per frame; bidirectional motion checks and eye-plane
+  consistency checks reject ambiguous jumps.
 - Protected video, secure desktops/UAC, and some exclusive fullscreen apps cannot
   be reliably captured or covered. Use windowed/borderless mode where possible.
 - All active monitors are enumerated automatically, using physical pixel
@@ -139,6 +142,9 @@ negative physical coordinates, ultrawide/portrait overlay pixels, screenshot
 visibility, private detector restoration, click-through flags, and GDI resource
 cleanup across 25 overlay lifecycles. These synthetic/off-screen geometry tests
 do not substitute for testing every physical monitor/DPI/GPU combination.
+The motion regressions measure eye position over 90 real-face frames and 120
+textured translation frames. A desktop timing regression changes the source
+window between capture and restoration to reject mixed-frame eye-strip patches.
 The image crate is a development
 dependency used only by tests/the optional scene fixture.
 
@@ -157,7 +163,9 @@ An additional ignored `browser_window_surface_captures_all_four_faces` regressio
 expects a local Chrome window titled `Pyra browser coverage test - Google Chrome`
 showing four copies of the reference image (400, 260, 160, 128 pixels wide).
 It verifies that native accelerated rendering plus local scans retain all four
-faces; run it explicitly while that fixture is open.
+faces, then runs 60 capture/tracking frames with visible bars and requires each
+eye position to stay within 4 pixels of its unoccluded reference. Close other
+Pyra instances and keep the fixture visible when running it explicitly.
 
 `Pyra.exe --status` writes current health to standard output when invoked with
 redirected output. `--diagnostics` loads the model, runs blank-frame inference,

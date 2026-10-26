@@ -105,8 +105,17 @@ impl Tracker {
                     if let Some((dx, dy)) =
                         displacement(&self.previous, &self.current, &track.face, sx, sy)
                     {
-                        track.face.translate(dx as f32 / sx, dy as f32 / sy);
-                        track.seen = now;
+                        let mut candidate = track.face.clone();
+                        candidate.translate(dx as f32 / sx, dy as f32 / sy);
+                        let consistent = (dx == 0 && dy == 0)
+                            || displacement(&self.current, &self.previous, &candidate, sx, sy)
+                                .is_some_and(|(bx, by)| {
+                                    ((dx + bx) as f32).hypot((dy + by) as f32) <= 3.
+                                });
+                        if consistent {
+                            track.face = candidate;
+                            track.seen = now;
+                        }
                     }
                 }
             }
@@ -135,6 +144,20 @@ impl Tracker {
                 .max_by(|a, b| a.1.total_cmp(&b.1));
             if let Some((i, _)) = best {
                 let old = &self.tracks[i].face;
+                // A stable face box must not suddenly move its eye plane down
+                // towards the mouth. Preserve normalized eye placement through
+                // one inconsistent landmark result; actual box motion is kept.
+                let expected = (old.eyes[0][1] + old.eyes[1][1]) * 0.5;
+                let projected = face.y + (expected - old.y) / old.h.max(1.) * face.h;
+                let measured = (face.eyes[0][1] + face.eyes[1][1]) * 0.5;
+                if face.overlap(old) > 0.55
+                    && (measured - projected).abs() > (face.h * 0.18).max(5.)
+                {
+                    for (eye, prior) in face.eyes.iter_mut().zip(old.eyes) {
+                        eye[0] = face.x + (prior[0] - old.x) / old.w.max(1.) * face.w;
+                        eye[1] = face.y + (prior[1] - old.y) / old.h.max(1.) * face.h;
+                    }
+                }
                 let movement =
                     (face.eyes[0][0] - old.eyes[0][0]).hypot(face.eyes[0][1] - old.eyes[0][1]);
                 if movement < face.w * 0.07 {
@@ -272,6 +295,87 @@ fn displacement(previous: &Gray, current: &Gray, f: &Face, sx: f32, sy: f32) -> 
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn bad_eye_landmarks_do_not_jump_to_the_mouth_but_real_motion_is_kept() {
+        let now = Instant::now();
+        let good = Face {
+            x: 20.,
+            y: 20.,
+            w: 100.,
+            h: 100.,
+            eyes: [[45., 60.], [95., 60.]],
+            score: 0.95,
+        };
+        let mut tracker = Tracker::default();
+        tracker.update(vec![good.clone()], now);
+        let mut bad = good.clone();
+        bad.eyes = [[45., 95.], [95., 95.]];
+        bad.score = 0.7;
+        tracker.update(vec![bad], now + Duration::from_millis(50));
+        assert!((tracker.tracks[0].face.bar(1., 1.).y - 60.).abs() < 0.1);
+        let mut moved = good;
+        moved.translate(0., 12.);
+        tracker.update(vec![moved], now + Duration::from_millis(100));
+        assert!((tracker.tracks[0].face.bar(1., 1.).y - 72.).abs() < 0.1);
+    }
+    #[test]
+    fn moving_sequence_has_no_track_dropouts_or_cumulative_vertical_drift() {
+        let frame = |dx: usize, dy: usize| {
+            let mut data = vec![230u8; 360 * 280 * 4];
+            for y in 0..84 {
+                for x in 0..64 {
+                    let v = ((x * 71 + y * 37 + x * y * 13) % 230) as u8;
+                    let at = ((40 + dy + y) * 360 + 70 + dx + x) * 4;
+                    data[at..at + 3].fill(v);
+                }
+            }
+            data
+        };
+        let now = Instant::now();
+        let first = frame(0, 0);
+        let mut tracker = Tracker::default();
+        tracker.frame(
+            &Image {
+                pixels: &first,
+                width: 360,
+                height: 280,
+            },
+            now,
+        );
+        tracker.update(
+            vec![Face {
+                x: 70.,
+                y: 40.,
+                w: 64.,
+                h: 84.,
+                eyes: [[86., 68.], [118., 68.]],
+                score: 0.95,
+            }],
+            now,
+        );
+        for step in 1usize..=120 {
+            let p = step % 60;
+            let triangle = if p <= 30 { p } else { 60 - p };
+            let (dx, dy) = (triangle * 2, triangle * 3);
+            let data = frame(dx, dy);
+            tracker.frame(
+                &Image {
+                    pixels: &data,
+                    width: 360,
+                    height: 280,
+                },
+                now + Duration::from_millis(step as u64 * 33),
+            );
+            assert_eq!(tracker.tracks.len(), 1, "track flickered at frame {step}");
+            let bar = tracker.tracks[0].face.bar(1., 1.);
+            assert!(
+                (bar.y - (68 + dy) as f32).abs() <= 1.,
+                "vertical drift at frame {step}: {} vs {}",
+                bar.y,
+                68 + dy
+            );
+        }
+    }
     #[test]
     fn wide_and_portrait_tracking_preserve_short_axis_detail() {
         for (w, h) in [(3440, 1440), (5120, 1440), (7680, 2160), (1440, 3440)] {

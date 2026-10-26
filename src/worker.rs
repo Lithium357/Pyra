@@ -1,6 +1,6 @@
 use crate::{
     capture::{self, Capture, Monitor, WindowCache},
-    detection::{Bar, Detector, Region},
+    detection::{Bar, Detector, Region, suppress},
     native::{self, IDLE, LIVE, Mapping, PAUSED, RECOVERING, STOP, Shared},
     overlay::Overlay,
     scanning::Scanner,
@@ -139,7 +139,7 @@ pub fn run(name: &str) -> Result<()> {
                 s.next_overview = start;
             }
             // Screenshots retain the bars. Only the private detector input
-            // restores covered pixels from underlying window surfaces.
+            // restores coherent visible regions from underlying window surfaces.
             s.capture
                 .grab_clean(&all_bars, &handles, &mut window_cache)?;
             let image = s.capture.surface.image();
@@ -147,6 +147,8 @@ pub fn run(name: &str) -> Result<()> {
             let tile_change = s.scanner.observe(&image, native::tick());
             any_change |= changed || tile_change;
             let scan_start = Instant::now();
+            let mut found = Vec::new();
+            let mut checked = Vec::new();
             if cut || (changed && scan_start >= s.next_overview) {
                 let full = Region {
                     x: 0,
@@ -155,7 +157,8 @@ pub fn run(name: &str) -> Result<()> {
                     h: image.height,
                 };
                 let faces = detector.detect(&image, full, threshold as f32 / 100.)?;
-                s.tracker.update(faces, Instant::now());
+                found.extend(faces);
+                checked.push((full, full.w.max(full.h) as f32 / 640. * 24.));
                 s.next_overview = Instant::now() + Duration::from_millis(500);
             }
             // Local checks preserve landmark detail regardless of monitor shape.
@@ -168,8 +171,8 @@ pub fn run(name: &str) -> Result<()> {
                 let region = face_region(&s.tracker.tracks[i].face, image.width, image.height);
                 s.face_cursor = s.face_cursor.wrapping_add(1);
                 let faces = detector.detect(&image, region, threshold as f32 / 100.)?;
-                s.tracker.verify(&faces, region, 0.);
-                s.tracker.update(faces, Instant::now());
+                found.extend(faces);
+                checked.push((region, 0.));
                 s.next_face_check = Instant::now() + Duration::from_millis(face_ms);
             }
             let mut scans = 0;
@@ -179,12 +182,19 @@ pub fn run(name: &str) -> Result<()> {
                 && let Some((i, region)) = s.scanner.next()
             {
                 let faces = detector.detect(&image, region, threshold as f32 / 100.)?;
-                s.tracker.verify(&faces, region, 0.);
-                s.tracker.update(faces, Instant::now());
+                found.extend(faces);
+                checked.push((region, 0.));
                 s.scanner.scanned(i, native::tick());
                 scans += 1;
                 shared.heartbeat.store(native::tick(), Ordering::Relaxed);
             }
+            // Resolve overlapping scales before touching tracks. Updating after
+            // every crop let the last, weaker crop overwrite better landmarks.
+            let found = suppress(found);
+            for (region, minimum) in checked {
+                s.tracker.verify(&found, region, minimum);
+            }
+            s.tracker.update(found, Instant::now());
             s.bars.clear();
             for track in &s.tracker.tracks {
                 let mut b = track.face.bar(

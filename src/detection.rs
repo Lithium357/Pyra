@@ -422,4 +422,84 @@ mod tests {
         }
         Ok(())
     }
+    #[test]
+    #[ignore = "requires PYRA_RUNTIME and PYRA_TEST_IMAGE"]
+    fn moving_real_face_keeps_eye_bars_on_target_without_dropouts() -> Result<()> {
+        let source = image::open(std::env::var("PYRA_TEST_IMAGE")?)?.to_rgba8();
+        let bgra = |im: &image::RgbaImage| {
+            im.pixels()
+                .flat_map(|p| [p[2], p[1], p[0], 255])
+                .collect::<Vec<_>>()
+        };
+        let original = bgra(&source);
+        let mut detector = Detector::new(Path::new(&std::env::var("PYRA_RUNTIME")?))?;
+        let baseline = detector.detect(
+            &Image {
+                pixels: &original,
+                width: source.width() as usize,
+                height: source.height() as usize,
+            },
+            Region {
+                x: 0,
+                y: 0,
+                w: source.width() as usize,
+                h: source.height() as usize,
+            },
+            0.65,
+        )?;
+        ensure!(baseline.len() == 1, "reference requires exactly one face");
+        let target_y =
+            (baseline[0].eyes[0][1] + baseline[0].eyes[1][1]) * 0.5 * 256. / source.height() as f32;
+        let small = bgra(&image::imageops::resize(
+            &source,
+            256,
+            256,
+            image::imageops::FilterType::Triangle,
+        ));
+        let mut pixels = vec![240u8; 960 * 600 * 4];
+        let mut tracker = crate::tracking::Tracker::default();
+        let start = std::time::Instant::now();
+        let mut maximum = 0f32;
+        for step in 0usize..90 {
+            let p = step % 60;
+            let t = if p <= 30 { p } else { 60 - p };
+            let (x, y) = (80 + t * 2, 40 + t * 3);
+            pixels.fill(240);
+            for row in 0..256 {
+                pixels[((y + row) * 960 + x) * 4..((y + row) * 960 + x + 256) * 4]
+                    .copy_from_slice(&small[row * 256 * 4..(row + 1) * 256 * 4]);
+            }
+            let frame = Image {
+                pixels: &pixels,
+                width: 960,
+                height: 600,
+            };
+            let now = start + std::time::Duration::from_millis(step as u64 * 33);
+            tracker.frame(&frame, now);
+            if step % 3 == 0 {
+                let found = detector.detect(
+                    &frame,
+                    Region {
+                        x: 0,
+                        y: 0,
+                        w: 960,
+                        h: 600,
+                    },
+                    0.65,
+                )?;
+                tracker.update(found, now);
+            }
+            ensure!(
+                tracker.tracks.len() == 1,
+                "bar dropped/duplicated at frame {step}"
+            );
+            let error = (tracker.tracks[0].face.bar(1., 1.).y - (y as f32 + target_y)).abs();
+            maximum = maximum.max(error);
+            ensure!(error <= 8., "eye bar drifted {error:.2}px at frame {step}");
+        }
+        println!(
+            "90 moving real-face frames: no dropouts; maximum vertical eye-bar error={maximum:.2}px"
+        );
+        Ok(())
+    }
 }

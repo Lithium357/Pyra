@@ -238,8 +238,8 @@ impl Capture {
     pub fn grab(&mut self) -> Result<()> {
         self.grab_with_layers(true)
     }
-    /// Capture normally (so other screen tools see our bars), then restore only
-    /// our overlay's pixels from each underlying window's redirected window DC.
+    /// Capture normally (so other screen tools see our bars), then replace each
+    /// affected window's visible region with a coherent, overlay-free frame.
     /// The visible-region subtraction preserves foreground-window occlusion.
     pub fn grab_clean(
         &mut self,
@@ -286,7 +286,13 @@ impl Capture {
                 dc: self.surface.dc,
                 origin: (m.x, m.y),
                 cache,
+                uncovered: CreateRectRgn(m.x, m.y, m.x + m.w as i32, m.y + m.h as i32),
             };
+            let _uncovered = RegionHandle(context.uncovered);
+            ensure!(
+                !context.uncovered.is_null(),
+                "allocate coherent capture visibility region"
+            );
             EnumWindows(Some(restore_window), &mut context as *mut _ as LPARAM);
             SelectClipRgn(self.surface.dc, null_mut());
             GdiFlush();
@@ -339,6 +345,7 @@ struct RestoreContext<'a> {
     dc: HDC,
     origin: (i32, i32),
     cache: &'a mut WindowCache,
+    uncovered: HRGN,
 }
 
 #[link(name = "dwmapi")]
@@ -350,6 +357,14 @@ unsafe extern "system" fn restore_window(hwnd: HWND, data: LPARAM) -> i32 {
     unsafe {
         let context = &mut *(data as *mut RestoreContext<'_>);
         if context.overlays.contains(&hwnd) || IsWindowVisible(hwnd) == 0 || IsIconic(hwnd) != 0 {
+            return 1;
+        }
+        // Click-through layered utility windows (cursor/highlight overlays,
+        // for example) do not occlude their whole rectangular bounds. Their
+        // window DC can contain the already-composited desktop, including our
+        // bars. Look through them to the application's independent surface.
+        let style = GetWindowLongPtrW(hwnd, GWL_EXSTYLE) as u32;
+        if style & (WS_EX_LAYERED | WS_EX_TRANSPARENT) == (WS_EX_LAYERED | WS_EX_TRANSPARENT) {
             return 1;
         }
         let mut cloaked = 0u32;
@@ -375,9 +390,20 @@ unsafe extern "system" fn restore_window(hwnd: HWND, data: LPARAM) -> i32 {
         if window.0.is_null() || visible.0.is_null() {
             return 1;
         }
-        if CombineRgn(visible.0, context.remaining, window.0, RGN_AND) == NULLREGION {
+        if CombineRgn(visible.0, context.uncovered, window.0, RGN_AND) == NULLREGION {
             return 1;
         }
+        let affected = RegionHandle(CreateRectRgn(0, 0, 0, 0));
+        let needed = CombineRgn(affected.0, visible.0, context.remaining, RGN_AND) != NULLREGION;
+        // Occluding foreground windows must remain intact even when they have
+        // no bars. Consume their visible area before examining windows below.
+        CombineRgn(context.uncovered, context.uncovered, visible.0, RGN_DIFF);
+        if !needed {
+            return 1;
+        }
+        // Replace this window's entire visible region from ONE source frame.
+        // Patching just an eye strip mixed desktop time T0 with render time T1,
+        // which let the overlay alter the tracker's apparent facial motion.
         let mut dc = GetWindowDC(hwnd);
         if dc.is_null() {
             return 1;
