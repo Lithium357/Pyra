@@ -1,0 +1,47 @@
+name: Windows native build
+on:
+  push:
+  pull_request:
+
+jobs:
+  build:
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: rustfmt, clippy
+      - uses: Swatinem/rust-cache@v2
+      - run: cargo fmt --check
+      - run: cargo clippy --all-targets --locked -- -D warnings
+      - run: cargo test --locked
+      - run: cargo build --release --locked
+      - name: Package portable native app
+        shell: pwsh
+        run: |
+          Invoke-WebRequest https://github.com/microsoft/onnxruntime/releases/download/v1.22.0/onnxruntime-win-x64-1.22.0.zip -OutFile runtime.zip
+          if ((Get-FileHash runtime.zip -Algorithm SHA256).Hash -ne '174C616EFC0271194488642A72F1A514E01487DA4DFE84C49296D66E40EBE0DA') { throw 'Runtime checksum mismatch' }
+          Expand-Archive runtime.zip runtime
+          New-Item -ItemType Directory -Force dist/Pyra/licenses | Out-Null
+          Copy-Item target/release/pyra.exe dist/Pyra/Pyra.exe
+          Copy-Item runtime/onnxruntime-win-x64-1.22.0/lib/*.dll dist/Pyra/
+          Copy-Item README.md,THIRD_PARTY.md dist/Pyra/
+          Copy-Item LICENSE dist/Pyra/licenses/LICENSE-Pyra.txt
+          Copy-Item models/LICENSE-YuNet.txt dist/Pyra/licenses/
+          Copy-Item runtime/onnxruntime-win-x64-1.22.0/LICENSE dist/Pyra/licenses/LICENSE-ONNXRuntime.txt
+          Copy-Item runtime/onnxruntime-win-x64-1.22.0/ThirdPartyNotices.txt dist/Pyra/licenses/ONNXRuntime-ThirdPartyNotices.txt
+          $cargoRoot = if ($env:CARGO_HOME) { $env:CARGO_HOME } else { Join-Path $env:USERPROFILE .cargo }
+          $dependencyRoot = Join-Path $cargoRoot registry/src
+          Get-ChildItem $dependencyRoot -Directory | Get-ChildItem -Directory | ForEach-Object {
+            $crateFolder = $_
+            $licenseFiles = Get-ChildItem $crateFolder.FullName -File | Where-Object { $_.Name -match '^(LICENSE|LICENCE|COPYING|NOTICE)' }
+            if ($licenseFiles) {
+              $destination = Join-Path dist/Pyra/licenses/rust $crateFolder.Name
+              New-Item -ItemType Directory -Force $destination | Out-Null
+              $licenseFiles | Copy-Item -Destination $destination
+            }
+          }
+      - uses: actions/upload-artifact@v4
+        with:
+          name: Pyra-windows-x64
+          path: dist/Pyra/
