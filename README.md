@@ -23,27 +23,41 @@ The tray menu offers:
 
 | Setting | Behavior |
 |---|---|
-| Balanced | 640-pixel whole-display inference, plus overlapping detailed tiles; target 20 capture/tracking cycles/s when changing. |
-| More detail | More frequent detections and tile scans; target 25 cycles/s. |
-| Low power | Less frequent whole-display detection, no detailed tile scans; target 10 cycles/s. Small faces are more likely to be missed. |
+| Balanced | Overlapping 800-pixel local regions, supplementary overview scans, and high-resolution checks of tracked faces; target 20 capture/tracking cycles/s. |
+| More detail | 640-pixel local regions and a larger inference time budget; target 25 cycles/s. |
+| Low power | 1280-pixel regions and a smaller inference budget; target 10 cycles/s. Small faces are more likely to be missed. |
 | Sensitivity | Lower model confidence catches more faces, with more false positives. |
 | Bar width/thickness | Adjusts only the eye bar; never switches to full-face masks. |
 | Start when I sign in | Opt-in current-user startup entry. Disable before moving/deleting the portable folder. |
 
-These are scheduling targets, not guaranteed frame rates. Multiple monitors and
-busy screens increase cycle time. Static content is sampled at 10 Hz; repeated
-inference and unchanged overlay uploads are skipped. Initial detailed tile scans
-continue even on static content, so small stationary faces can be discovered.
+These are scheduling targets, not guaranteed frame rates. Multiple monitors,
+large windows, and busy screens increase cycle time. Per-region fingerprints
+keep changed regions pending until scanned, even if content immediately becomes
+still. A time budget processes multiple pending regions per cycle; an animation
+in one corner does not reset the whole display sweep. Stable regions are verified
+infrequently and unchanged overlay uploads are skipped.
+
+Ultrawide and portrait displays use local inference regions instead of depending
+on a whole display shrunk to 640 pixels. Tracking targets 480 pixels on the short
+axis, bounded at 2560 pixels on the long axis. Monitor positions remain signed
+physical pixel coordinates, including displays above/left of the primary display.
+Mirrored monitor rectangles are deduplicated. Overlay geometry is reasserted to
+its physical rectangle after scaling or layout changes.
 
 ## Privacy and limits
 
 - All screen processing is local. Frames live in memory and are overwritten;
   no screenshots, facial identities, or video are saved. Diagnostic logs contain
   failures, startup/recovery events, and monitor dimensions, not images.
-- This is a **viewing overlay**, not a redacted recording pipeline. The bars
-  deliberately exclude themselves from standard capture APIs so the detector can
-  keep seeing the underlying eyes. Screen recordings/screenshots may therefore
-  show the original faces.
+- Bars are ordinary, capturable overlay windows: **desktop screenshots and
+  desktop recordings include them**. Pyra's detector privately restores only
+  their covered areas from underlying window surfaces, preserving foreground
+  occlusion. Hardware-accelerated browsers and common Qt/WPF applications use a
+  cached window-render fallback. Caches are shared across monitors and bounded
+  to four reusable window bitmaps. No overlay is globally hidden from capture.
+- A capture of a specific application window can omit external overlay windows,
+  including Pyra. Use desktop/display capture when the bars must be included.
+  This remains a best-effort live filter, not guaranteed irreversible redaction.
 - New faces can appear before a bar is placed. Small faces, profiles, obscured
   eyes, drawings, and fast video cuts can be missed. Tracking handles translation;
   fresh landmark detections update tilt, scale, and facial movement.
@@ -63,7 +77,9 @@ its heartbeat for 15 seconds, the supervisor kills its Windows Job Object and
 starts a fresh worker. Repeated failures use up to 30 seconds of backoff. Killing
 or quitting the supervisor also kills its worker, preventing orphan overlays.
 
-Capture/detection failures rebuild the worker. Display changes and sleep/resume
+Capture/detection failures rebuild the worker. A short responsiveness check
+precedes accelerated window rendering; an app or driver that subsequently stalls
+is still covered by the worker watchdog. Display changes and sleep/resume
 recreate display resources. The supervisor reasserts overlay z-order every second
 and the worker is proactively recycled every 12 hours to bound long-term native
 allocator drift. Recovery/recycling briefly removes the bars. The tray reports
@@ -113,13 +129,17 @@ DLL, and the OpenCV reference `lena.jpg` (not distributed with this repo):
 ```powershell
 $env:PYRA_RUNTIME = 'C:\absolute\path\onnxruntime.dll'
 $env:PYRA_TEST_IMAGE = 'C:\absolute\path\lena.jpg'
-cargo test --release --locked -- --include-ignored --nocapture --test-threads=1
+cargo test --release --locked --bin pyra -- --include-ignored --skip browser_window_surface --nocapture --test-threads=1
 ```
 
-Those tests check real-model eye coordinates, four mixed-size faces using the
-detailed tiles, rotated bar geometry, NMS, tiled coverage, motion tracking, scene
-cuts, physical overlay geometry, capture exclusion, click-through flags, and GDI
-resource cleanup across 25 overlay lifecycles. The image crate is a development
+Those tests check real-model eye coordinates, mixed-size faces, real-model
+5120×1440/1080×3840 canvases, complete scan grids up to 11520-pixel-wide layouts,
+pending scan persistence/fairness, rotated bars, NMS, tracking, scene cuts,
+negative physical coordinates, ultrawide/portrait overlay pixels, screenshot
+visibility, private detector restoration, click-through flags, and GDI resource
+cleanup across 25 overlay lifecycles. These synthetic/off-screen geometry tests
+do not substitute for testing every physical monitor/DPI/GPU combination.
+The image crate is a development
 dependency used only by tests/the optional scene fixture.
 
 For a native manual scene with four face sizes:
@@ -133,6 +153,12 @@ animate/scroll, then test sleep/resume, display changes, and multi-day idle/vide
 workloads. Kill the worker PID from `data/pyra.log` to exercise crash recovery;
 the supervisor should remain alive and start a new worker automatically.
 
+An additional ignored `browser_window_surface_captures_all_four_faces` regression
+expects a local Chrome window titled `Pyra browser coverage test - Google Chrome`
+showing four copies of the reference image (400, 260, 160, 128 pixels wide).
+It verifies that native accelerated rendering plus local scans retain all four
+faces; run it explicitly while that fixture is open.
+
 `Pyra.exe --status` writes current health to standard output when invoked with
 redirected output. `--diagnostics` loads the model, runs blank-frame inference,
 enumerates displays, and writes the result to `data/pyra.log`. `--quit` asks the
@@ -143,15 +169,17 @@ running tray instance to exit cleanly. `--background` suppresses the startup tip
 | Module | Responsibility |
 |---|---|
 | `native.rs` | Win32 tray/menu/hotkeys, settings, sign-in startup, shared state, Job Object and watchdog. |
-| `capture.rs` | Monitor enumeration and reusable top-down BGRA GDI capture surfaces; RAII resource cleanup. |
+| `capture.rs` | Monitor enumeration, reusable BGRA capture, visible-region restoration beneath bars, and bounded accelerated window-render caches; RAII cleanup. |
 | `detection.rs` | Reusable bilinear BGR input tensor, YuNet inference/landmark decoding, NMS, detailed tiles, eye-bar geometry. |
 | `tracking.rs` | Sparse coarse/fine patch tracking with blurred coarse search, short missed-match persistence and scene-cut resets. |
-| `overlay.rs` | Reusable ARGB surfaces and transparent, topmost, click-through, capture-excluded native windows. |
-| `worker.rs` | Adaptive scan scheduling, static-content inference suppression, topology/resource recovery and overlay updates. |
+| `overlay.rs` | Reusable ARGB surfaces and capturable, transparent, topmost, click-through native windows. |
+| `scanning.rs` | Aspect-independent local grids, persistent per-region fingerprints, and fair pending scan selection. |
+| `worker.rs` | Budgeted scanning, local face checks, static-content suppression, topology/resource recovery and overlay updates. |
 
 GDI capture favors a small dependency footprint and straightforward recovery. It
-still copies screen pixels; high-refresh 4K multi-monitor use would benefit from a
-future DXGI/Desktop Duplication capture backend and GPU composition. Switching to
+still copies screen pixels, and restoring hardware-accelerated windows adds work.
+High-refresh 4K multi-monitor use would benefit from a future asynchronous GPU
+window-capture backend and GPU composition. Switching to
 Rust removes interpreter/UI-framework overhead; it does not make model inference
 or desktop copies free.
 

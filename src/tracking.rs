@@ -11,7 +11,7 @@ struct Gray {
 }
 impl Gray {
     fn fill(&mut self, image: &Image<'_>) {
-        let scale = (640. / image.width.max(image.height) as f32).min(1.);
+        let scale = tracking_scale(image.width, image.height);
         self.w = (image.width as f32 * scale).round().max(1.) as usize;
         self.h = (image.height as f32 * scale).round().max(1.) as usize;
         self.pixels.resize(self.w * self.h, 0);
@@ -59,7 +59,14 @@ pub struct Track {
     pub face: Face,
     seen: Instant,
     detected: Instant,
+    confirmed: Instant,
     missed_checks: u8,
+}
+
+fn tracking_scale(width: usize, height: usize) -> f32 {
+    (480. / width.min(height) as f32)
+        .min(2560. / width.max(height) as f32)
+        .min(1.)
 }
 
 #[derive(Default)]
@@ -140,6 +147,7 @@ impl Tracker {
                     face,
                     seen: now,
                     detected: now,
+                    confirmed: now,
                     missed_checks: 0,
                 };
                 matched[i] = true;
@@ -150,6 +158,7 @@ impl Tracker {
                     face,
                     seen: now,
                     detected: now,
+                    confirmed: now,
                     missed_checks: 0,
                 });
             }
@@ -160,6 +169,9 @@ impl Tracker {
     /// Two authoritative negative scans remove that stale bar even if the patch
     /// matcher keeps finding texture. Coarse scans don't invalidate tiny faces.
     pub fn verify(&mut self, detections: &[Face], region: Region, minimum_width: f32) {
+        self.verify_at(detections, region, minimum_width, Instant::now());
+    }
+    fn verify_at(&mut self, detections: &[Face], region: Region, minimum_width: f32, now: Instant) {
         for track in &mut self.tracks {
             let f = &track.face;
             if f.w >= minimum_width
@@ -170,12 +182,17 @@ impl Tracker {
             {
                 if detections.iter().any(|d| d.overlap(f) > 0.22) {
                     track.missed_checks = 0;
+                    track.confirmed = now;
                 } else {
                     track.missed_checks = track.missed_checks.saturating_add(1);
                 }
             }
         }
-        self.tracks.retain(|t| t.missed_checks < 2);
+        // Fast overlapping tiles can disagree within one frame. Require a short
+        // confirmation grace period as well as negative checks to avoid flashing.
+        self.tracks.retain(|t| {
+            t.missed_checks < 2 || now.duration_since(t.confirmed) < Duration::from_millis(700)
+        });
     }
 }
 
@@ -255,6 +272,15 @@ fn displacement(previous: &Gray, current: &Gray, f: &Face, sx: f32, sy: f32) -> 
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn wide_and_portrait_tracking_preserve_short_axis_detail() {
+        for (w, h) in [(3440, 1440), (5120, 1440), (7680, 2160), (1440, 3440)] {
+            let scale = tracking_scale(w, h);
+            assert!((w.min(h) as f32 * scale - 480.).abs() < 1.);
+            assert!(w.max(h) as f32 * scale <= 2560.);
+        }
+        assert_eq!(tracking_scale(400, 300), 1.);
+    }
     #[test]
     fn patch_tracking_follows_translation() {
         let mut a = Gray {
@@ -340,16 +366,17 @@ mod tests {
         tiny.x = 200.;
         tiny.w = 25.;
         tiny.h = 30.;
-        tracker.update(vec![large, tiny], Instant::now());
+        let now = Instant::now();
+        tracker.update(vec![large, tiny], now);
         let region = Region {
             x: 0,
             y: 0,
             w: 1000,
             h: 800,
         };
-        tracker.verify(&[], region, 50.);
+        tracker.verify_at(&[], region, 50., now + Duration::from_millis(100));
         assert_eq!(tracker.tracks.len(), 2);
-        tracker.verify(&[], region, 50.);
+        tracker.verify_at(&[], region, 50., now + Duration::from_millis(800));
         assert_eq!(tracker.tracks.len(), 1);
         assert_eq!(tracker.tracks[0].face.w, 25.);
     }

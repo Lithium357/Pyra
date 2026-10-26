@@ -220,6 +220,7 @@ pub fn suppress(mut faces: Vec<Face>) -> Vec<Face> {
     kept
 }
 
+#[cfg(test)]
 pub fn tiles(width: usize, height: usize) -> Vec<Region> {
     let positions = |length: usize| {
         let count = length.saturating_sub(768).div_ceil(600);
@@ -377,6 +378,48 @@ mod tests {
             "actual model: 1 reference + 4 mixed-size faces; warm mean {:.2} ms",
             start.elapsed().as_secs_f64() * 10.
         );
+        Ok(())
+    }
+    #[test]
+    #[ignore = "requires PYRA_RUNTIME and PYRA_TEST_IMAGE"]
+    fn actual_model_finds_faces_across_ultrawide_and_portrait_images() -> Result<()> {
+        let source = image::open(std::env::var("PYRA_TEST_IMAGE")?)?.to_rgba8();
+        let small =
+            image::imageops::resize(&source, 160, 160, image::imageops::FilterType::Triangle);
+        let mut detector = Detector::new(Path::new(&std::env::var("PYRA_RUNTIME")?))?;
+        for (w, h, positions) in [
+            (5120, 1440, vec![(20, 50), (2460, 650), (4930, 1200)]),
+            (1080, 3840, vec![(20, 50), (800, 1800), (450, 3650)]),
+        ] {
+            let mut canvas = image::RgbaImage::from_pixel(w, h, image::Rgba([240, 240, 240, 255]));
+            for (x, y) in positions {
+                image::imageops::overlay(&mut canvas, &small, x, y);
+            }
+            let pixels = canvas
+                .pixels()
+                .flat_map(|p| [p[2], p[1], p[0], 255])
+                .collect::<Vec<_>>();
+            let frame = Image {
+                pixels: &pixels,
+                width: w as usize,
+                height: h as usize,
+            };
+            let mut faces = Vec::new();
+            let tiles = crate::scanning::grid(w as usize, h as usize, 800);
+            for region in &tiles {
+                faces.extend(detector.detect(&frame, *region, 0.65)?);
+            }
+            let faces = suppress(faces);
+            ensure!(
+                faces.len() == 3,
+                "{w}x{h}: expected 3 faces near distant edges, got {}",
+                faces.len()
+            );
+            println!(
+                "{w}x{h}: all 3 edge/center faces found in {} local tiles",
+                tiles.len()
+            );
+        }
         Ok(())
     }
 }

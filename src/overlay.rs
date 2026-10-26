@@ -21,6 +21,9 @@ pub struct Overlay {
 }
 
 impl Overlay {
+    pub fn handle(&self) -> HWND {
+        self.hwnd
+    }
     pub fn new(monitor: Monitor) -> Result<Self> {
         static CLASS: OnceLock<u16> = OnceLock::new();
         let name = wide("Pyra.EyeOverlay");
@@ -57,13 +60,6 @@ impl Overlay {
         };
         ensure!(!hwnd.is_null(), "create overlay window");
         unsafe {
-            if SetWindowDisplayAffinity(hwnd, WDA_EXCLUDEFROMCAPTURE) == 0 {
-                DestroyWindow(hwnd);
-                anyhow::bail!(
-                    "Cannot exclude overlay from capture. Windows 10 2004+ is required: {}",
-                    std::io::Error::last_os_error()
-                );
-            }
             ShowWindow(hwnd, SW_SHOWNOACTIVATE);
         }
         let mut out = Self {
@@ -81,11 +77,11 @@ impl Overlay {
             SetWindowPos(
                 self.hwnd,
                 HWND_TOPMOST,
-                0,
-                0,
-                0,
-                0,
-                SWP_NOMOVE | SWP_NOSIZE | SWP_NOACTIVATE,
+                self.monitor.x,
+                self.monitor.y,
+                self.monitor.w as i32,
+                self.monitor.h as i32,
+                SWP_NOACTIVATE,
             );
         }
     }
@@ -170,7 +166,230 @@ mod tests {
     use super::*;
     #[test]
     #[ignore = "requires an unlocked Windows desktop"]
-    fn native_overlay_exclusion_geometry_and_resource_cleanup() -> Result<()> {
+    fn ultrawide_and_portrait_overlay_pixels_use_physical_negative_origins() -> Result<()> {
+        unsafe {
+            windows_sys::Win32::UI::HiDpi::SetProcessDpiAwarenessContext(
+                windows_sys::Win32::UI::HiDpi::DPI_AWARENESS_CONTEXT_PER_MONITOR_AWARE_V2,
+            );
+        }
+        for m in [
+            Monitor {
+                x: -5120,
+                y: -200,
+                w: 5120,
+                h: 1440,
+            },
+            Monitor {
+                x: 2000,
+                y: -3840,
+                w: 1080,
+                h: 3840,
+            },
+            Monitor {
+                x: -3440,
+                y: 1200,
+                w: 3440,
+                h: 1440,
+            },
+        ] {
+            let mut overlay = Overlay::new(m)?;
+            let bars = [
+                Bar {
+                    x: m.x as f32 + 40.,
+                    y: m.y as f32 + 40.,
+                    w: 60.,
+                    h: 20.,
+                    angle: 0.,
+                },
+                Bar {
+                    x: m.x as f32 + m.w as f32 - 40.,
+                    y: m.y as f32 + m.h as f32 - 40.,
+                    w: 60.,
+                    h: 20.,
+                    angle: 0.,
+                },
+            ];
+            overlay.paint(&bars, true)?;
+            overlay.reassert();
+            let mut rect: RECT = unsafe { std::mem::zeroed() };
+            unsafe {
+                GetWindowRect(overlay.hwnd, &mut rect);
+            }
+            ensure!(
+                rect.left == m.x
+                    && rect.top == m.y
+                    && rect.right - rect.left == m.w as i32
+                    && rect.bottom - rect.top == m.h as i32,
+                "physical coordinates were virtualized or clipped"
+            );
+            let pixels = overlay.surface.pixels_mut();
+            ensure!(
+                pixels[40 * m.w + 40] == 0xff000000,
+                "near-edge bar is misplaced"
+            );
+            ensure!(
+                pixels[(m.h - 40) * m.w + m.w - 40] == 0xff000000,
+                "far-edge bar is misplaced"
+            );
+            ensure!(
+                pixels[(m.h / 2) * m.w + m.w / 2] == 0,
+                "transparent space was filled"
+            );
+        }
+        Ok(())
+    }
+    #[test]
+    #[ignore = "requires the local Pyra browser coverage test window and PYRA_RUNTIME"]
+    fn browser_window_surface_captures_all_four_faces() -> Result<()> {
+        use crate::{
+            capture::Surface,
+            detection::{Detector, Region},
+        };
+        unsafe {
+            let hwnd = FindWindowW(
+                null(),
+                wide("Pyra browser coverage test - Google Chrome").as_ptr(),
+            );
+            ensure!(!hwnd.is_null(), "open the local browser fixture first");
+            let mut rect: RECT = std::mem::zeroed();
+            GetWindowRect(hwnd, &mut rect);
+            let surface = Surface::new(
+                (rect.right - rect.left) as usize,
+                (rect.bottom - rect.top) as usize,
+            )?;
+            let mut detector = Detector::new(&crate::native::runtime())?;
+            let dc = GetWindowDC(hwnd);
+            BitBlt(
+                surface.dc,
+                0,
+                0,
+                surface.w as i32,
+                surface.h as i32,
+                dc,
+                0,
+                0,
+                SRCCOPY,
+            );
+            ReleaseDC(hwnd, dc);
+            GdiFlush();
+            let full = Region {
+                x: 0,
+                y: 0,
+                w: surface.w,
+                h: surface.h,
+            };
+            let gdi = detector.detect(&surface.image(), full, 0.65)?.len();
+            let begin = std::time::Instant::now();
+            let success = windows_sys::Win32::Storage::Xps::PrintWindow(hwnd, surface.dc, 2);
+            GdiFlush();
+            let elapsed = begin.elapsed();
+            let mut detections = detector.detect(&surface.image(), full, 0.65)?;
+            for tile in crate::scanning::grid(surface.w, surface.h, 800) {
+                detections.extend(detector.detect(&surface.image(), tile, 0.65)?);
+            }
+            let rendered = crate::detection::suppress(detections).len();
+            println!(
+                "Chrome: window DC faces={gdi}; PrintWindow faces={rendered}; render={elapsed:?}; success={success}"
+            );
+            ensure!(
+                rendered == 4,
+                "browser render did not capture all four faces"
+            );
+        }
+        Ok(())
+    }
+    #[test]
+    #[ignore = "requires an unlocked Windows desktop"]
+    fn ordinary_capture_sees_bars_but_detector_capture_sees_background() -> Result<()> {
+        use crate::capture::Capture;
+        #[link(name = "dwmapi")]
+        unsafe extern "system" {
+            fn DwmFlush() -> i32;
+        }
+        unsafe {
+            windows_sys::Win32::UI::HiDpi::SetProcessDpiAwarenessContext(
+                windows_sys::Win32::UI::HiDpi::DPI_AWARENESS_CONTEXT_PER_MONITOR_AWARE_V2,
+            );
+            let monitor = crate::capture::monitors()?[0];
+            let region = Monitor {
+                x: monitor.x + 100,
+                y: monitor.y + 100,
+                w: 240,
+                h: 120,
+            };
+            let class = wide("Pyra.CaptureTestBackdrop");
+            let instance = GetModuleHandleW(null());
+            let wc = WNDCLASSW {
+                lpfnWndProc: Some(DefWindowProcW),
+                hInstance: instance,
+                lpszClassName: class.as_ptr(),
+                hbrBackground: GetStockObject(WHITE_BRUSH) as HBRUSH,
+                ..std::mem::zeroed()
+            };
+            RegisterClassW(&wc);
+            let backdrop = CreateWindowExW(
+                WS_EX_TOPMOST | WS_EX_TOOLWINDOW | WS_EX_NOACTIVATE,
+                class.as_ptr(),
+                wide("Pyra capture test").as_ptr(),
+                WS_POPUP,
+                region.x,
+                region.y,
+                region.w as i32,
+                region.h as i32,
+                null_mut(),
+                null_mut(),
+                instance,
+                null(),
+            );
+            ensure!(!backdrop.is_null(), "create capture-test backdrop");
+            struct Backdrop(HWND);
+            impl Drop for Backdrop {
+                fn drop(&mut self) {
+                    unsafe {
+                        DestroyWindow(self.0);
+                    }
+                }
+            }
+            let _backdrop = Backdrop(backdrop);
+            ShowWindow(backdrop, SW_SHOWNOACTIVATE);
+            UpdateWindow(backdrop);
+            DwmFlush();
+            let mut overlay = Overlay::new(region)?;
+            let bars = [Bar {
+                x: region.x as f32 + 120.,
+                y: region.y as f32 + 60.,
+                w: 140.,
+                h: 30.,
+                angle: 0.,
+            }];
+            overlay.paint(&bars, true)?;
+            DwmFlush();
+            std::thread::sleep(std::time::Duration::from_millis(80));
+            let mut capture = Capture::new(region)?;
+            let center = (60 * region.w + 120) * 4;
+            capture.grab_with_layers(true)?;
+            let ordinary = capture.surface.pixels()[center..center + 3].to_vec();
+            capture.grab_clean(
+                &bars,
+                &[overlay.handle()],
+                &mut crate::capture::WindowCache::default(),
+            )?;
+            let detector = capture.surface.pixels()[center..center + 3].to_vec();
+            println!("ordinary screenshot={ordinary:?}; clean detector input={detector:?}");
+            ensure!(
+                ordinary == [0, 0, 0],
+                "standard screenshot omitted the bar: {ordinary:?}"
+            );
+            ensure!(
+                detector == [255, 255, 255],
+                "detector sees its own bar: {detector:?}"
+            );
+        }
+        Ok(())
+    }
+    #[test]
+    #[ignore = "requires an unlocked Windows desktop"]
+    fn native_overlay_capture_visibility_geometry_and_resource_cleanup() -> Result<()> {
         use windows_sys::Win32::System::Threading::{
             GR_GDIOBJECTS, GetCurrentProcess, GetGuiResources,
         };
@@ -185,8 +404,8 @@ mod tests {
                 let mut affinity = 0;
                 ensure!(
                     GetWindowDisplayAffinity(overlay.hwnd, &mut affinity) != 0
-                        && affinity == WDA_EXCLUDEFROMCAPTURE,
-                    "overlay not excluded from capture"
+                        && affinity == WDA_NONE,
+                    "overlay is hidden from screenshots"
                 );
                 ensure!(
                     GetWindowLongPtrW(overlay.hwnd, GWL_EXSTYLE) as u32 & WS_EX_TRANSPARENT != 0,
