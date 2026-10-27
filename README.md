@@ -8,6 +8,10 @@ There is no Python runtime, browser shell, web service, or network code.
 Real faces use YuNet; anime and illustrated faces also use dedicated face and
 eye models. Bars follow detected eyes, including a single visible eye in a
 profile, rather than assuming the eyes occupy a fixed part of a face box.
+Faces cut off by an internal scan tile are left to overlapping tiles and overview
+scans, preventing a large wallpaper face from becoming several partial tracks.
+Repeated scans preserve bar geometry on unchanged face pixels; higher-resolution
+refinements and changes inside the face can still update the eye placement.
 
 Every bar displays **[censored]** in white Doto text, centered and rotated with
 the bar. The font is embedded and loaded privately; no font installation or

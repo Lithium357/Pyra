@@ -85,6 +85,7 @@ pub struct Track {
     confirmed: Instant,
     missed_checks: u8,
     weak_eyes: u8,
+    appearance_changed: bool,
 }
 
 fn tracking_scale(width: usize, height: usize) -> f32 {
@@ -162,6 +163,11 @@ impl Tracker {
                         track.detected = now;
                         continue;
                     }
+                    // Accumulate changes until a detector result consumes them.
+                    // Other windows or a desktop clock must not make a static
+                    // face's repeated, slightly different landmarks jitter.
+                    track.appearance_changed |=
+                        patch_changed(&self.previous, &self.current, &track.face, sx, sy);
                     if let Some((dx, dy)) =
                         displacement(&self.previous, &self.current, &track.face, sx, sy)
                     {
@@ -206,7 +212,13 @@ impl Tracker {
                 // but must not replace landmarks refined by a close local scan.
                 // Keep tracking its current frame position until a comparably
                 // detailed scan can establish a real pose/scale change.
-                if face.detail < old.detail * 0.6 && face.same_face(old) {
+                if face.same_face(old)
+                    && (face.detail < old.detail * 0.6
+                        || (!self.tracks[i].appearance_changed
+                            && !self.previous.pixels.is_empty()
+                            && face.eye_count == old.eye_count
+                            && face.detail <= old.detail * 1.15))
+                {
                     let track = &mut self.tracks[i];
                     track.seen = now;
                     track.detected = now;
@@ -253,6 +265,7 @@ impl Tracker {
                     confirmed: now,
                     missed_checks: 0,
                     weak_eyes,
+                    appearance_changed: false,
                 };
                 matched[i] = true;
             } else if self.tracks.len() < 512
@@ -265,6 +278,7 @@ impl Tracker {
                     confirmed: now,
                     missed_checks: 0,
                     weak_eyes: 0,
+                    appearance_changed: false,
                 });
             }
         }
@@ -302,6 +316,20 @@ impl Tracker {
             t.missed_checks < 2 || now.duration_since(t.confirmed) < Duration::from_millis(700)
         });
     }
+}
+
+fn patch_changed(previous: &Gray, current: &Gray, f: &Face, sx: f32, sy: f32) -> bool {
+    let mut changed = 0;
+    for y in 0..8 {
+        for x in 0..8 {
+            let px = ((f.x + f.w * (0.1 + x as f32 * 0.11)) * sx).round() as i32;
+            let py = ((f.y + f.h * (0.1 + y as f32 * 0.11)) * sy).round() as i32;
+            if let (Some(a), Some(b)) = (previous.at(px, py), current.at(px, py)) {
+                changed += usize::from(a.abs_diff(b) > 2);
+            }
+        }
+    }
+    changed > 1
 }
 
 fn displacement(previous: &Gray, current: &Gray, f: &Face, sx: f32, sy: f32) -> Option<(f32, f32)> {
@@ -406,6 +434,63 @@ fn displacement(previous: &Gray, current: &Gray, f: &Face, sx: f32, sy: f32) -> 
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn unchanged_face_stays_still_while_other_screen_content_changes() {
+        let now = Instant::now();
+        let mut pixels = vec![128; 200 * 200 * 4];
+        let mut tracker = Tracker::default();
+        tracker.frame(
+            &Image {
+                pixels: &pixels,
+                width: 200,
+                height: 200,
+            },
+            now,
+        );
+        let face = Face {
+            x: 40.,
+            y: 40.,
+            w: 100.,
+            h: 100.,
+            eyes: [[65., 70.], [115., 80.]],
+            score: 0.9,
+            eye_count: 2,
+            detail: 100.,
+            eye_band: 0.,
+        };
+        tracker.update(vec![face.clone()], now);
+        pixels[..20 * 4].fill(0);
+        tracker.frame(
+            &Image {
+                pixels: &pixels,
+                width: 200,
+                height: 200,
+            },
+            now + Duration::from_millis(50),
+        );
+        let mut noisy = face.clone();
+        noisy.translate(2., 3.);
+        tracker.update(vec![noisy], now + Duration::from_millis(60));
+        assert_eq!(tracker.tracks[0].face.eyes, face.eyes);
+        // A pose change inside the face must release the stationary guard.
+        for y in 40..140 {
+            for x in 40..140 {
+                pixels[(y * 200 + x) * 4..(y * 200 + x) * 4 + 3].fill(140);
+            }
+        }
+        tracker.frame(
+            &Image {
+                pixels: &pixels,
+                width: 200,
+                height: 200,
+            },
+            now + Duration::from_millis(100),
+        );
+        let mut pose = face.clone();
+        pose.eyes[1][1] += 8.;
+        tracker.update(vec![pose], now + Duration::from_millis(110));
+        assert!(tracker.tracks[0].face.eyes[1][1] > face.eyes[1][1] + 5.);
+    }
     #[test]
     fn bad_eye_landmarks_do_not_jump_to_the_mouth_but_real_motion_is_kept() {
         let now = Instant::now();

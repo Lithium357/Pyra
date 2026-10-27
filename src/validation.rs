@@ -3,6 +3,218 @@ use anyhow::Result;
 use image::{Rgb, RgbImage};
 use std::{path::PathBuf, time::Instant};
 
+// Optional native feedback fixture for a private wallpaper reproduction. It
+// renders an image in our own window without changing the user's wallpaper.
+struct StaticDesktop {
+    hwnd: windows_sys::Win32::Foundation::HWND,
+    capture: crate::capture::Capture,
+    overlay: crate::overlay::Overlay,
+    cache: crate::capture::WindowCache,
+}
+impl StaticDesktop {
+    fn new(image: &Image<'_>) -> Result<Self> {
+        use windows_sys::Win32::{
+            Graphics::Gdi::*, System::LibraryLoader::GetModuleHandleW, UI::WindowsAndMessaging::*,
+        };
+        unsafe {
+            windows_sys::Win32::UI::HiDpi::SetProcessDpiAwarenessContext(
+                windows_sys::Win32::UI::HiDpi::DPI_AWARENESS_CONTEXT_PER_MONITOR_AWARE_V2,
+            );
+            let screen = crate::capture::monitors()?[0];
+            anyhow::ensure!(
+                image.width + 40 <= screen.w && image.height + 40 <= screen.h,
+                "private fixture must fit on the first display"
+            );
+            let m = crate::capture::Monitor {
+                x: screen.x + 20,
+                y: screen.y + 20,
+                w: image.width,
+                h: image.height,
+            };
+            let name: Vec<_> = "Pyra.StaticWallpaperTest"
+                .encode_utf16()
+                .chain(Some(0))
+                .collect();
+            let instance = GetModuleHandleW(std::ptr::null());
+            let class = WNDCLASSW {
+                lpfnWndProc: Some(DefWindowProcW),
+                hInstance: instance,
+                lpszClassName: name.as_ptr(),
+                ..std::mem::zeroed()
+            };
+            RegisterClassW(&class);
+            let hwnd = CreateWindowExW(
+                WS_EX_TOPMOST | WS_EX_TOOLWINDOW | WS_EX_NOACTIVATE,
+                name.as_ptr(),
+                name.as_ptr(),
+                WS_POPUP,
+                m.x,
+                m.y,
+                m.w as i32,
+                m.h as i32,
+                std::ptr::null_mut(),
+                std::ptr::null_mut(),
+                instance,
+                std::ptr::null(),
+            );
+            anyhow::ensure!(!hwnd.is_null(), "create wallpaper feedback fixture");
+            let mut scene = Self {
+                hwnd,
+                capture: crate::capture::Capture::new(m)?,
+                overlay: crate::overlay::Overlay::new(m)?,
+                cache: crate::capture::WindowCache::default(),
+            };
+            ShowWindow(hwnd, SW_SHOWNOACTIVATE);
+            UpdateWindow(hwnd);
+            for (pixel, bytes) in scene
+                .capture
+                .surface
+                .pixels_mut()
+                .iter_mut()
+                .zip(image.pixels.as_chunks::<4>().0)
+            {
+                *pixel = u32::from_le_bytes(*bytes);
+            }
+            let dc = GetWindowDC(hwnd);
+            let ok = BitBlt(
+                dc,
+                0,
+                0,
+                m.w as i32,
+                m.h as i32,
+                scene.capture.surface.dc,
+                0,
+                0,
+                SRCCOPY,
+            );
+            ReleaseDC(hwnd, dc);
+            anyhow::ensure!(ok != 0, "draw wallpaper fixture");
+            Ok(scene)
+        }
+    }
+    fn frame(&mut self, tracker: &crate::tracking::Tracker) -> Result<Image<'_>> {
+        let m = self.capture.monitor;
+        let bars: Vec<_> = tracker
+            .tracks
+            .iter()
+            .map(|t| {
+                let mut b = t.face.bar(1., 1.);
+                b.x += m.x as f32;
+                b.y += m.y as f32;
+                b
+            })
+            .collect();
+        self.overlay.paint(&bars, true)?;
+        #[link(name = "dwmapi")]
+        unsafe extern "system" {
+            fn DwmFlush() -> i32;
+        }
+        unsafe {
+            DwmFlush();
+        }
+        self.cache.begin_frame();
+        self.capture
+            .grab_clean(&bars, &[self.overlay.handle()], &mut self.cache)?;
+        Ok(self.capture.surface.image())
+    }
+}
+impl Drop for StaticDesktop {
+    fn drop(&mut self) {
+        unsafe {
+            windows_sys::Win32::UI::WindowsAndMessaging::DestroyWindow(self.hwnd);
+        }
+    }
+}
+
+#[test]
+#[ignore = "requires PYRA_RUNTIME and PYRA_CORPUS, or PYRA_STATIC_IMAGE for a private local reproduction"]
+fn static_image_scan_consistency() -> Result<()> {
+    let im = if let Some(path) = std::env::var_os("PYRA_STATIC_IMAGE") {
+        image::open(path)?.to_rgb8()
+    } else {
+        let group =
+            image::open(PathBuf::from(std::env::var("PYRA_CORPUS")?).join("generated-group.jpg"))?
+                .to_rgb8();
+        image::imageops::resize(
+            &image::imageops::crop_imm(&group, 0, 0, 512, 512).to_image(),
+            1845,
+            956,
+            image::imageops::FilterType::Triangle,
+        )
+    };
+    let (w, h) = (im.width() as usize, im.height() as usize);
+    let pixels: Vec<_> = im.pixels().flat_map(|p| [p[2], p[1], p[0], 255]).collect();
+    let image = Image {
+        pixels: &pixels,
+        width: w,
+        height: h,
+    };
+    let mut desktop = std::env::var_os("PYRA_STATIC_DESKTOP")
+        .map(|_| StaticDesktop::new(&image))
+        .transpose()?;
+    let mut detector = Detector::new(&PathBuf::from(std::env::var("PYRA_RUNTIME")?))?;
+    let mut tracker = crate::tracking::Tracker::default();
+    let tiles = crate::scanning::grid(w, h, 800);
+    let full = Region { x: 0, y: 0, w, h };
+    let start = Instant::now();
+    let mut reference = None;
+    let mut max_shift = 0f32;
+    for frame in 0..90 {
+        let now = start + std::time::Duration::from_millis(frame * 100);
+        let native_frame = desktop
+            .as_mut()
+            .map(|scene| scene.frame(&tracker))
+            .transpose()?;
+        let image = native_frame.as_ref().unwrap_or(&image);
+        if native_frame.is_some() {
+            let altered = image
+                .pixels
+                .as_chunks::<4>()
+                .0
+                .iter()
+                .zip(pixels.as_chunks::<4>().0)
+                .filter(|(a, b)| a[..3] != b[..3])
+                .count();
+            anyhow::ensure!(
+                altered == 0,
+                "overlay feedback changed {altered} source pixels at frame {frame}"
+            );
+        }
+        tracker.frame(image, now);
+        let region = match frame % 3 {
+            0 => full,
+            1 if !tracker.tracks.is_empty() => {
+                crate::worker::face_region(&tracker.tracks[0].face, w, h)
+            }
+            _ => tiles[(frame as usize / 3) % tiles.len()],
+        };
+        let found = detector.detect(image, region, 0.65)?;
+        tracker.verify(
+            &found,
+            region,
+            if frame % 3 == 0 {
+                w.max(h) as f32 / 640. * 24.
+            } else {
+                0.
+            },
+        );
+        tracker.update(found, now);
+        if frame >= 18 {
+            anyhow::ensure!(
+                tracker.tracks.len() == 1,
+                "static image has {} tracks at {frame}",
+                tracker.tracks.len()
+            );
+            let bar = tracker.tracks[0].face.bar(1., 1.);
+            let origin = *reference.get_or_insert((bar.x, bar.y));
+            max_shift = max_shift.max((bar.x - origin.0).hypot(bar.y - origin.1));
+        }
+    }
+    println!("static image maximum bar displacement={max_shift:.2}px");
+    anyhow::ensure!(max_shift < 4., "stationary bar moved {max_shift}px");
+    Ok(())
+}
+
 fn reference_eyes(scale: f32) -> Vec<[[f32; 2]; 2]> {
     include_str!("../validation/anime-eyes.txt")
         .lines()

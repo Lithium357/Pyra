@@ -147,6 +147,15 @@ impl Detector {
                 found.push(face);
             }
         }
+        // A tile can turn half a large face into a convincing one-eyed face.
+        // Only the outer screen edges may truncate a detection: overlapping
+        // tiles and the overview supply complete faces at internal scan seams.
+        found.retain(|f| complete_in_region(f, region, image.width, image.height));
+        for face in &mut found {
+            if face.eyes[0][0] > face.eyes[1][0] {
+                face.eyes.swap(0, 1);
+            }
+        }
         Ok(suppress(found))
     }
 
@@ -256,6 +265,15 @@ impl Detector {
     }
 }
 
+fn complete_in_region(face: &Face, region: Region, width: usize, height: usize) -> bool {
+    let mx = (face.w * 0.03).max(3.);
+    let my = (face.h * 0.03).max(3.);
+    (region.x == 0 || face.x > region.x as f32 + mx)
+        && (region.y == 0 || face.y > region.y as f32 + my)
+        && (region.x + region.w == width || face.x + face.w < (region.x + region.w) as f32 - mx)
+        && (region.y + region.h == height || face.y + face.h < (region.y + region.h) as f32 - my)
+}
+
 pub fn suppress(mut faces: Vec<Face>) -> Vec<Face> {
     faces.sort_unstable_by(|a, b| b.score.total_cmp(&a.score));
     let mut kept: Vec<Face> = Vec::new();
@@ -321,6 +339,47 @@ mod tests {
             assert!((dx * c + dy * s).abs() < b.w / 2.);
             assert!((-dx * s + dy * c).abs() < b.h / 2.);
         }
+        // Internal scan seams cannot supply authoritative partial faces, but
+        // a character genuinely cropped by the display edge is still valid.
+        let full = Region {
+            x: 0,
+            y: 0,
+            w: 200,
+            h: 200,
+        };
+        assert!(complete_in_region(&f, full, 200, 200));
+        assert!(!complete_in_region(&f, Region { w: 110, ..full }, 200, 200));
+        assert!(!complete_in_region(
+            &f,
+            Region {
+                x: 10,
+                w: 190,
+                ..full
+            },
+            200,
+            200
+        ));
+        assert!(!complete_in_region(&f, Region { h: 140, ..full }, 200, 200));
+        assert!(!complete_in_region(
+            &f,
+            Region {
+                y: 20,
+                h: 180,
+                ..full
+            },
+            200,
+            200
+        ));
+        assert!(complete_in_region(
+            &f,
+            Region {
+                w: 110,
+                h: 140,
+                ..full
+            },
+            110,
+            140
+        ));
     }
     #[test]
     fn tiles_cover_odd_and_negative_origin_independent_displays() {

@@ -451,3 +451,75 @@ unsafe extern "system" fn restore_window(hwnd: HWND, data: LPARAM) -> i32 {
         1
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    #[ignore = "requires an unlocked desktop; checks the actual Explorer wallpaper surface"]
+    fn desktop_surface_excludes_overlay() -> Result<()> {
+        unsafe {
+            windows_sys::Win32::UI::HiDpi::SetProcessDpiAwarenessContext(
+                windows_sys::Win32::UI::HiDpi::DPI_AWARENESS_CONTEXT_PER_MONITOR_AWARE_V2,
+            );
+            unsafe extern "system" fn collect(hwnd: HWND, data: LPARAM) -> i32 {
+                unsafe {
+                    let mut name = [0; 256];
+                    let n = GetClassNameW(hwnd, name.as_mut_ptr(), 256).max(0) as usize;
+                    let class = String::from_utf16_lossy(&name[..n]);
+                    if IsWindowVisible(hwnd) != 0 && (class == "WorkerW" || class == "Progman") {
+                        (*(data as *mut Vec<HWND>)).push(hwnd);
+                    }
+                    1
+                }
+            }
+            let mut windows = Vec::<HWND>::new();
+            EnumWindows(Some(collect), &mut windows as *mut _ as LPARAM);
+            ensure!(!windows.is_empty(), "Explorer desktop not found");
+            for hwnd in windows {
+                let mut bounds = std::mem::zeroed();
+                GetWindowRect(hwnd, &mut bounds);
+                let m = Monitor {
+                    x: bounds.left,
+                    y: bounds.top,
+                    w: (bounds.right - bounds.left) as usize,
+                    h: (bounds.bottom - bounds.top) as usize,
+                };
+                println!("shell {hwnd:?}: {m:?}");
+                let before = Surface::new(m.w, m.h)?;
+                let dc = GetWindowDC(hwnd);
+                ensure!(!dc.is_null(), "open Explorer window DC");
+                let first = BitBlt(before.dc, 0, 0, m.w as i32, m.h as i32, dc, 0, 0, SRCCOPY);
+                GdiFlush();
+                let mut overlay = crate::overlay::Overlay::new(m)?;
+                let bars = [Bar {
+                    x: m.x as f32 + m.w as f32 * 0.5,
+                    y: m.y as f32 + m.h as f32 * 0.5,
+                    w: 400.,
+                    h: 100.,
+                    angle: 0.,
+                }];
+                overlay.paint(&bars, true)?;
+                std::thread::sleep(std::time::Duration::from_millis(150));
+                let after = Surface::new(m.w, m.h)?;
+                let second = BitBlt(after.dc, 0, 0, m.w as i32, m.h as i32, dc, 0, 0, SRCCOPY);
+                GdiFlush();
+                ReleaseDC(hwnd, dc);
+                ensure!(first != 0 && second != 0, "capture Explorer window surface");
+                let delta = before
+                    .pixels()
+                    .iter()
+                    .zip(after.pixels())
+                    .filter(|(a, b)| a != b)
+                    .count();
+                println!("shell GDI changed bytes={delta}");
+                ensure!(
+                    delta == 0,
+                    "Explorer's window DC contains overlay pixels or the wallpaper changed during this static-desktop test"
+                );
+            }
+        }
+        Ok(())
+    }
+}

@@ -55,6 +55,19 @@ cargo test --release --locked --bin pyra validation:: -- --ignored --nocapture -
   close-up scans. After 40 warmup frames it requires at least 98% eye-center
   coverage and limits duplicate bars to 1% of measured face-frames. It records
   scan count and frame processing time.
+- `static_image_scan_consistency` repeatedly alternates overview, tile and face
+  scans of one enlarged illustrated face. Internal scan edges must not create
+  extra one-eyed tracks or move the stationary bar. By default it uses a public
+  corpus crop. Set `PYRA_STATIC_IMAGE` to a local image to reproduce a private
+  wallpaper problem; the image is neither saved to reports nor uploaded. Set
+  `PYRA_STATIC_DESKTOP=1` on an unlocked desktop to render that image in a temporary
+  native window and exercise actual overlay capture for 90 cycles. The fixture
+  must fit on the first display. Every captured source pixel must remain identical
+  to the image despite the visible overlay. This does not change desktop settings.
+
+`capture::tests::desktop_surface_excludes_overlay` separately checks Explorer's
+actual Progman/WorkerW surface while a temporary bar is visible. Run it explicitly
+with `--ignored --nocapture` on a stationary, unlocked desktop with Pyra stopped.
 
 Neither these short runs nor CI establish months of uptime or correctness on
 every monitor/DPI/GPU combination. Legacy Lenna tests remain for geometry and
