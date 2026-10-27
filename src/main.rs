@@ -4,10 +4,10 @@ mod analysis;
 mod capture;
 mod detection;
 mod label;
+#[cfg(test)]
+mod local_corpus;
 mod native;
 mod overlay;
-#[cfg(test)]
-mod private_validation;
 mod scanning;
 mod stylized;
 mod tracking;

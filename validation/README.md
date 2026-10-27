@@ -87,7 +87,7 @@ capture regressions; they are not the main evidence of detection quality.
 
 ## Private local collections
 
-`private_validation::anime_scan_stability` is an opt-in local diagnostic, outside
+`local_corpus::anime_scan_stability` is an opt-in local diagnostic, outside
 the CI validation group. Set `PYRA_PRIVATE_MANIFEST` to a UTF-8 file with one local
 image path per line, `PYRA_PRIVATE_REPORT` to a local output directory, and
 `PYRA_RUNTIME` to the runtime DLL. `PYRA_PRIVATE_LIMIT` defaults to 128 images;
