@@ -12,6 +12,10 @@ Faces cut off by an internal scan tile are left to overlapping tiles and overvie
 scans, preventing a large wallpaper face from becoming several partial tracks.
 Repeated scans preserve bar geometry on unchanged face pixels; higher-resolution
 refinements and changes inside the face can still update the eye placement.
+Fast vertical movement uses a wider scroll search when a local match fails.
+Verified scroll motion guides other faces on the same page, while fixed faces
+keep their own stationary match. Detector results are moved from their captured
+frame to the current frame before bars are updated.
 
 Every bar displays **[censored]** in white Doto text, centered and rotated with
 the bar. The font is embedded and loaded privately; no font installation or

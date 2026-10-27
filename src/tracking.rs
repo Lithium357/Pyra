@@ -110,26 +110,28 @@ impl Tracker {
         if self.current.w != self.previous.w || self.current.h != self.previous.h {
             return None;
         }
-        let change: u64 = self
-            .current
-            .pixels
-            .iter()
-            .zip(&self.previous.pixels)
-            .map(|(&a, &b)| a.abs_diff(b) as u64)
-            .sum();
-        if change as f64 / self.current.pixels.len().max(1) as f64 > 38. {
-            return None;
-        }
         let sx = self.current.w as f32 / image.width as f32;
         let sy = self.current.h as f32 / image.height as f32;
         let mut projected = Vec::with_capacity(faces.len());
+        let mut hint = None;
         for mut face in faces {
-            if let Some((dx, dy)) = displacement(&self.current, &self.previous, &face, sx, sy) {
+            if let Some((dx, dy)) = displacement(&self.current, &self.previous, &face, sx, sy, hint)
+            {
                 let original = face.clone();
                 face.translate(dx / sx, dy / sy);
-                if displacement(&self.previous, &self.current, &face, sx, sy)
-                    .is_some_and(|(bx, by)| (dx + bx).hypot(dy + by) <= 3.)
+                if displacement(
+                    &self.previous,
+                    &self.current,
+                    &face,
+                    sx,
+                    sy,
+                    Some((-dx, -dy)),
+                )
+                .is_some_and(|(bx, by)| (dx + bx).hypot(dy + by) <= 3.)
                 {
+                    if dy.abs() > 16. {
+                        hint = Some((dx, dy));
+                    }
                     projected.push(face);
                 } else if dx == 0. && dy == 0. {
                     projected.push(original);
@@ -154,9 +156,49 @@ impl Tracker {
             }
             changed = changes > 3;
             cut = sum as f64 / self.current.pixels.len().max(1) as f64 > 38.;
+            let sx = self.current.w as f32 / image.width as f32;
+            let sy = self.current.h as f32 / image.height as f32;
+            let mut scroll_hint = None;
+            // Dense pages can change nearly every pixel during a scroll. A
+            // strong reversible face match distinguishes that from a cut.
+            if cut {
+                cut = !self.tracks.iter().take(8).any(|track| {
+                    let Some((dx, dy)) =
+                        displacement(&self.previous, &self.current, &track.face, sx, sy, None)
+                    else {
+                        return false;
+                    };
+                    if dy.abs() <= 16.
+                        || alignment_error(
+                            &self.previous,
+                            &self.current,
+                            &track.face,
+                            sx,
+                            sy,
+                            (dx, dy),
+                        ) > 8.
+                    {
+                        return false;
+                    }
+                    let mut candidate = track.face.clone();
+                    candidate.translate(dx / sx, dy / sy);
+                    let reversible = displacement(
+                        &self.current,
+                        &self.previous,
+                        &candidate,
+                        sx,
+                        sy,
+                        Some((-dx, -dy)),
+                    )
+                    .is_some_and(|(bx, by)| (dx + bx).hypot(dy + by) <= 1.);
+                    if reversible {
+                        scroll_hint = Some((dx, dy));
+                    }
+                    reversible
+                });
+            }
             if !cut {
-                let sx = self.current.w as f32 / image.width as f32;
-                let sy = self.current.h as f32 / image.height as f32;
+                let mut hint = scroll_hint;
                 for track in &mut self.tracks {
                     if !changed {
                         track.seen = now;
@@ -169,14 +211,24 @@ impl Tracker {
                     track.appearance_changed |=
                         patch_changed(&self.previous, &self.current, &track.face, sx, sy);
                     if let Some((dx, dy)) =
-                        displacement(&self.previous, &self.current, &track.face, sx, sy)
+                        displacement(&self.previous, &self.current, &track.face, sx, sy, hint)
                     {
                         let mut candidate = track.face.clone();
                         candidate.translate(dx / sx, dy / sy);
                         let consistent = (dx == 0. && dy == 0.)
-                            || displacement(&self.current, &self.previous, &candidate, sx, sy)
-                                .is_some_and(|(bx, by)| (dx + bx).hypot(dy + by) <= 3.);
+                            || displacement(
+                                &self.current,
+                                &self.previous,
+                                &candidate,
+                                sx,
+                                sy,
+                                Some((-dx, -dy)),
+                            )
+                            .is_some_and(|(bx, by)| (dx + bx).hypot(dy + by) <= 3.);
                         if consistent {
+                            if dy.abs() > 16. {
+                                hint = Some((dx, dy));
+                            }
                             track.face = candidate;
                             track.seen = now;
                         }
@@ -318,6 +370,35 @@ impl Tracker {
     }
 }
 
+fn alignment_error(
+    previous: &Gray,
+    current: &Gray,
+    f: &Face,
+    sx: f32,
+    sy: f32,
+    delta: (f32, f32),
+) -> f32 {
+    let (mut sum, mut count) = (0., 0);
+    for y in 0..8 {
+        for x in 0..8 {
+            let px = ((f.x + f.w * (0.15 + x as f32 * 0.1)) * sx).round();
+            let py = ((f.y + f.h * (0.15 + y as f32 * 0.1)) * sy).round();
+            if let (Some(a), Some(b)) = (
+                previous.at(px as i32, py as i32),
+                current.sample(px + delta.0, py + delta.1),
+            ) {
+                sum += (a as f32 - b).abs();
+                count += 1;
+            }
+        }
+    }
+    if count >= 32 {
+        sum / count as f32
+    } else {
+        f32::INFINITY
+    }
+}
+
 fn patch_changed(previous: &Gray, current: &Gray, f: &Face, sx: f32, sy: f32) -> bool {
     let mut changed = 0;
     for y in 0..8 {
@@ -332,7 +413,14 @@ fn patch_changed(previous: &Gray, current: &Gray, f: &Face, sx: f32, sy: f32) ->
     changed > 1
 }
 
-fn displacement(previous: &Gray, current: &Gray, f: &Face, sx: f32, sy: f32) -> Option<(f32, f32)> {
+fn displacement(
+    previous: &Gray,
+    current: &Gray,
+    f: &Face,
+    sx: f32,
+    sy: f32,
+    hint: Option<(f32, f32)>,
+) -> Option<(f32, f32)> {
     let mut samples = [(0i32, 0i32, 0u8, 0u8); 64];
     let mut n = 0;
     // Sample the central face area, keeping surrounding page text out of the patch.
@@ -370,7 +458,7 @@ fn displacement(previous: &Gray, current: &Gray, f: &Face, sx: f32, sy: f32) -> 
             let v = if blurred { smooth } else { raw };
             total += v.abs_diff(next) as u32;
         }
-        total as f32 / n as f32 + ((dx * dx + dy * dy) as f32).sqrt() * 0.025
+        total as f32 / n as f32 + ((dx * dx + dy * dy) as f32).sqrt() * 0.0025
     };
     let mut best = (0, 0);
     let mut score = cost(0, 0, false);
@@ -382,12 +470,49 @@ fn displacement(previous: &Gray, current: &Gray, f: &Face, sx: f32, sy: f32) -> 
         return None;
     }
     score = cost(0, 0, true);
-    for dy in (-32..=32).step_by(4) {
-        for dx in (-32..=32).step_by(4) {
-            let candidate = cost(dx, dy, true);
-            if candidate < score {
-                score = candidate;
-                best = (dx, dy);
+    let mut good_hint = false;
+    if let Some((dx, dy)) = hint {
+        let candidate = (dx.round() as i32, dy.round() as i32);
+        let hinted = cost(candidate.0, candidate.1, true);
+        if hinted < score {
+            best = candidate;
+            score = hinted;
+            good_hint = score - (best.0 as f32).hypot(best.1 as f32) * 0.0025 < 2.5;
+        }
+    }
+    if !good_hint {
+        for dy in (-32..=32).step_by(4) {
+            for dx in (-32..=32).step_by(4) {
+                let candidate = cost(dx, dy, true);
+                if candidate < score {
+                    score = candidate;
+                    best = (dx, dy);
+                }
+            }
+        }
+        // Wheel/touchpad scrolling can move hundreds of screen pixels between
+        // captures. Search a long vertical corridor only when the cheap local
+        // match is poor; stationary faces retain the constant-time early return.
+        if score > 2.5 {
+            let reach = (current.h as i32 * 3 / 4).min(480);
+            for dy in (-reach..=reach).step_by(4) {
+                for dx in [-8, 0, 8] {
+                    let candidate = cost(dx, dy, true);
+                    if candidate < score {
+                        score = candidate;
+                        best = (dx, dy);
+                    }
+                }
+            }
+            let corridor = best;
+            for dy in (corridor.1 - 4..=corridor.1 + 4).step_by(2) {
+                for dx in (corridor.0 - 8..=corridor.0 + 8).step_by(2) {
+                    let candidate = cost(dx, dy, true);
+                    if candidate < score {
+                        score = candidate;
+                        best = (dx, dy);
+                    }
+                }
             }
         }
     }
@@ -413,7 +538,7 @@ fn displacement(previous: &Gray, current: &Gray, f: &Face, sx: f32, sy: f32) -> 
             };
             sum += (raw as f32 - value).abs();
         }
-        sum / n as f32 + dx.hypot(dy) * 0.025
+        sum / n as f32 + dx.hypot(dy) * 0.0025
     };
     let mut refined = (best.0 as f32, best.1 as f32);
     score = fractional_cost(refined.0, refined.1);
@@ -434,6 +559,80 @@ fn displacement(previous: &Gray, current: &Gray, f: &Face, sx: f32, sy: f32) -> 
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn dense_page_scrolls_preserve_tracks_and_project_delayed_detections() {
+        let page = |shift: i32| {
+            let mut pixels = vec![255; 512 * 512 * 4];
+            for y in 0..512 {
+                for x in 0..512 {
+                    let yy = if y < 32 {
+                        y as f32
+                    } else {
+                        (y as i32 - if x < 300 { shift } else { -shift }) as f32
+                    };
+                    let value = (110.
+                        + 70. * (x as f32 * 0.071 + yy * 0.043).sin()
+                        + 55. * (x as f32 * 0.027 - yy * 0.051).cos())
+                    .clamp(0., 255.) as u8;
+                    pixels[(y * 512 + x) * 4..(y * 512 + x) * 4 + 3].fill(value);
+                }
+            }
+            pixels
+        };
+        let face = Face {
+            x: 160.,
+            y: 240.,
+            w: 100.,
+            h: 100.,
+            eyes: [[185., 270.], [235., 270.]],
+            score: 0.95,
+            eye_count: 2,
+            detail: 100.,
+            eye_band: 0.,
+        };
+        let first = page(0);
+        let mut second_face = face.clone();
+        second_face.translate(190., 0.);
+        let source = Image {
+            pixels: &first,
+            width: 512,
+            height: 512,
+        };
+        let now = Instant::now();
+        let mut tracker = Tracker::default();
+        tracker.frame(&source, now);
+        tracker.update(vec![face.clone(), second_face.clone()], now);
+        for (step, shift) in [128, -128, 64, -64, 0].into_iter().enumerate() {
+            let pixels = page(shift);
+            let image = Image {
+                pixels: &pixels,
+                width: 512,
+                height: 512,
+            };
+            let (_, cut) =
+                tracker.frame(&image, now + Duration::from_millis((step as u64 + 1) * 50));
+            assert!(!cut, "dense scroll {shift} was mistaken for a scene cut");
+            assert_eq!(tracker.tracks.len(), 2);
+            assert!(
+                (tracker.tracks[0].face.y - face.y - shift as f32).abs() < 2.,
+                "shift={shift}, tracked={:?}",
+                tracker.tracks[0].face
+            );
+            assert!(
+                (tracker.tracks[1].face.y - face.y + shift as f32).abs() < 2.,
+                "a separate pane followed another pane's scroll hint"
+            );
+            let projected = tracker
+                .project(&source, vec![face.clone(), second_face.clone()])
+                .unwrap();
+            assert_eq!(projected.len(), 2);
+            assert!(
+                (projected[0].y - face.y - shift as f32).abs() < 2.,
+                "delayed detection stayed at its old location"
+            );
+            assert!((projected[1].y - face.y + shift as f32).abs() < 2.);
+        }
+    }
     #[test]
     fn unchanged_face_stays_still_while_other_screen_content_changes() {
         let now = Instant::now();
@@ -662,7 +861,7 @@ mod tests {
             detail: 100.,
             eye_band: 0.,
         };
-        assert_eq!(displacement(&a, &b, &f, 1., 1.), Some((12., 7.)));
+        assert_eq!(displacement(&a, &b, &f, 1., 1., None), Some((12., 7.)));
     }
     #[test]
     fn scene_cut_clears_tracks() {

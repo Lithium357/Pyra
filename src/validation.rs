@@ -14,7 +14,8 @@ struct StaticDesktop {
 impl StaticDesktop {
     fn new(image: &Image<'_>) -> Result<Self> {
         use windows_sys::Win32::{
-            Graphics::Gdi::*, System::LibraryLoader::GetModuleHandleW, UI::WindowsAndMessaging::*,
+            Graphics::Gdi::UpdateWindow, System::LibraryLoader::GetModuleHandleW,
+            UI::WindowsAndMessaging::*,
         };
         unsafe {
             windows_sys::Win32::UI::HiDpi::SetProcessDpiAwarenessContext(
@@ -22,12 +23,12 @@ impl StaticDesktop {
             );
             let screen = crate::capture::monitors()?[0];
             anyhow::ensure!(
-                image.width + 40 <= screen.w && image.height + 40 <= screen.h,
+                image.width <= screen.w && image.height <= screen.h,
                 "private fixture must fit on the first display"
             );
             let m = crate::capture::Monitor {
-                x: screen.x + 20,
-                y: screen.y + 20,
+                x: screen.x + (screen.w - image.width).min(20) as i32,
+                y: screen.y + (screen.h - image.height).min(20) as i32,
                 w: image.width,
                 h: image.height,
             };
@@ -66,7 +67,19 @@ impl StaticDesktop {
             };
             ShowWindow(hwnd, SW_SHOWNOACTIVATE);
             UpdateWindow(hwnd);
-            for (pixel, bytes) in scene
+            scene.present(image)?;
+            Ok(scene)
+        }
+    }
+    fn present(&mut self, image: &Image<'_>) -> Result<()> {
+        use windows_sys::Win32::Graphics::Gdi::*;
+        unsafe {
+            let m = self.capture.monitor;
+            anyhow::ensure!(
+                image.width == m.w && image.height == m.h,
+                "fixture size changed"
+            );
+            for (pixel, bytes) in self
                 .capture
                 .surface
                 .pixels_mut()
@@ -75,21 +88,21 @@ impl StaticDesktop {
             {
                 *pixel = u32::from_le_bytes(*bytes);
             }
-            let dc = GetWindowDC(hwnd);
+            let dc = GetWindowDC(self.hwnd);
             let ok = BitBlt(
                 dc,
                 0,
                 0,
                 m.w as i32,
                 m.h as i32,
-                scene.capture.surface.dc,
+                self.capture.surface.dc,
                 0,
                 0,
                 SRCCOPY,
             );
-            ReleaseDC(hwnd, dc);
+            ReleaseDC(self.hwnd, dc);
             anyhow::ensure!(ok != 0, "draw wallpaper fixture");
-            Ok(scene)
+            Ok(())
         }
     }
     fn frame(&mut self, tracker: &crate::tracking::Tracker) -> Result<Image<'_>> {
@@ -666,6 +679,16 @@ fn annotated_real_groups() -> Result<()> {
 #[test]
 #[ignore = "requires PYRA_CORPUS, PYRA_REPORT and PYRA_RUNTIME; six-second live inference test"]
 fn asynchronous_anime_motion() -> Result<()> {
+    asynchronous_motion(false)
+}
+
+#[test]
+#[ignore = "requires PYRA_CORPUS, PYRA_REPORT and PYRA_RUNTIME; fast scrolling and reversals"]
+fn asynchronous_fast_scrolling() -> Result<()> {
+    asynchronous_motion(true)
+}
+
+fn asynchronous_motion(fast: bool) -> Result<()> {
     use crate::{
         analysis::{Analyzer, Job},
         capture::Monitor,
@@ -696,6 +719,7 @@ fn asynchronous_anime_motion() -> Result<()> {
     let (mut covered, mut total, mut jobs, mut max_frame_ms, mut extras) = (0, 0, 0, 0, 0);
     let tiles = crate::scanning::grid(1920, 1080, 800);
     let mut failures_printed = 0;
+    let mut desktop: Option<StaticDesktop> = None;
     for frame in 0..120usize {
         let begin = Instant::now();
         let p = frame % 60;
@@ -703,14 +727,55 @@ fn asynchronous_anime_motion() -> Result<()> {
         let mut scene = RgbImage::from_pixel(1920, 1080, Rgb([214, 214, 214]));
         let mut expected = Vec::new();
         for (i, portrait) in portraits.iter().enumerate() {
-            let x = 190. + i as f32 * 320. + triangle * (if i == 1 { -1. } else { 1. });
-            let y = 170. + triangle * (i as f32 + 1.);
+            let x = 190.
+                + i as f32 * 320.
+                + if fast {
+                    0.
+                } else {
+                    triangle * (if i == 1 { -1. } else { 1. })
+                };
+            let y = if fast {
+                let offsets = [
+                    0., 120., 300., 540., 360., 120., 0., 0., 0., 240., 480., 300., 60., 0., 0., 0.,
+                ];
+                90. + if frame < 40 {
+                    0.
+                } else {
+                    offsets[(frame - 40) % offsets.len()]
+                }
+            } else {
+                170. + triangle * (i as f32 + 1.)
+            };
             image::imageops::replace(&mut scene, portrait, x as i64, y as i64);
             expected.push(choices[i].2.map(|e| [e[0] + x, e[1] + y]));
         }
         let mut pixels = Vec::with_capacity(1920 * 1080 * 4);
         for p in scene.pixels() {
             pixels.extend_from_slice(&[p[2], p[1], p[0], 255]);
+        }
+        if fast && std::env::var_os("PYRA_SCROLL_DESKTOP").is_some() {
+            let source = Image {
+                pixels: &pixels,
+                width: 1920,
+                height: 1080,
+            };
+            if let Some(desktop) = &mut desktop {
+                desktop.present(&source)?;
+            } else {
+                desktop = Some(StaticDesktop::new(&source)?);
+            }
+            let captured = desktop.as_mut().unwrap().frame(&tracker)?;
+            anyhow::ensure!(
+                captured
+                    .pixels
+                    .as_chunks::<4>()
+                    .0
+                    .iter()
+                    .zip(pixels.as_chunks::<4>().0)
+                    .all(|(a, b)| a[..3] == b[..3]),
+                "scroll capture contains overlay pixels or stale image regions at frame {frame}"
+            );
+            pixels.copy_from_slice(captured.pixels);
         }
         tracker.frame(
             &Image {
@@ -720,7 +785,11 @@ fn asynchronous_anime_motion() -> Result<()> {
             },
             Instant::now(),
         );
-        if let Some(done) = analyzer.poll()? {
+        // Deliberately deliver fast-scroll results only every third capture:
+        // projection must correct a stale image as well as frame-to-frame flow.
+        if (!fast || frame % 3 == 0)
+            && let Some(done) = analyzer.poll()?
+        {
             inflight = false;
             jobs += 1;
             if let Some(found) = tracker.project(
@@ -786,12 +855,16 @@ fn asynchronous_anime_motion() -> Result<()> {
         }
     }
     println!(
-        "asynchronous 1920x1080 motion: coverage={covered}/{total}; extra face-frames={extras}; completed scans={jobs}; max frame={max_frame_ms}ms"
+        "asynchronous 1920x1080 motion fast={fast}: coverage={covered}/{total}; extra face-frames={extras}; completed scans={jobs}; max frame={max_frame_ms}ms"
     );
     let report = PathBuf::from(std::env::var("PYRA_REPORT")?);
     std::fs::create_dir_all(&report)?;
     std::fs::write(
-        report.join("async-motion.txt"),
+        report.join(if fast {
+            "fast-scroll.txt"
+        } else {
+            "async-motion.txt"
+        }),
         format!(
             "frames=120\nwarmup_frames=40\nwidth=1920\nheight=1080\nexpected_face_frames={total}\ncovered_face_frames={covered}\nextra_face_frames={extras}\ncompleted_scans={jobs}\nmaximum_frame_processing_ms={max_frame_ms}\n"
         ),

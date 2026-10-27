@@ -55,6 +55,18 @@ cargo test --release --locked --bin pyra validation:: -- --ignored --nocapture -
   close-up scans. After 40 warmup frames it requires at least 98% eye-center
   coverage and limits duplicate bars to 1% of measured face-frames. It records
   scan count and frame processing time.
+- `asynchronous_fast_scrolling` moves the same three characters by up to 240
+  pixels between 1920×1080 captures, with reversals and sudden stops. Results
+  are deliberately delivered only every third capture to test delayed detection
+  projection. It checks 240 face-frames after warmup using the same coverage and
+  duplicate limits. Set `PYRA_SCROLL_DESKTOP=1` on an unlocked desktop with Pyra
+  stopped to additionally exercise real native overlays and window capture.
+  Every captured source pixel must match the newly rendered image, including
+  regions covered by the previous bar positions. The fixture must fit on the
+  first display. This is a scrolling simulation, not an automated browser test.
+- `tracking::tests::dense_page_scrolls_preserve_tracks_and_project_delayed_detections`
+  separately checks large pixel changes over a textured page with a fixed header,
+  so scrolling does not clear tracks as though it were an unrelated scene cut.
 - `static_image_scan_consistency` repeatedly alternates overview, tile and face
   scans of one enlarged illustrated face. Internal scan edges must not create
   extra one-eyed tracks or move the stationary bar. By default it uses a public
