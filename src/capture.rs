@@ -415,17 +415,53 @@ unsafe extern "system" fn restore_window(hwnd: HWND, data: LPARAM) -> i32 {
         let mut name = [0u16; 256];
         let count = GetClassNameW(hwnd, name.as_mut_ptr(), name.len() as i32).max(0) as usize;
         let class = String::from_utf16_lossy(&name[..count]);
+        // Explorer's background is painted by child surfaces. Its parent DC
+        // can have no readable pixels even when BitBlt reports success.
+        // Render the complete shell window, including its children.
         let accelerated = class.starts_with("Chrome_")
             || class.starts_with("Qt")
             || class == "MozillaWindowClass"
             || class.starts_with("HwndWrapper")
             || class == "ApplicationFrameWindow"
+            || class == "Progman"
+            || class == "WorkerW"
+            || class == "WinUIDesktopWin32WindowClass"
             || class == "Windows.UI.Core.CoreWindow";
         let mut release = true;
-        if accelerated && let Some(rendered) = context.cache.render(hwnd, &bounds) {
-            ReleaseDC(hwnd, dc);
-            dc = rendered;
-            release = false;
+        if accelerated {
+            if let Some(rendered) = context.cache.render(hwnd, &bounds) {
+                ReleaseDC(hwnd, dc);
+                dc = rendered;
+                release = false;
+            } else if crate::native::tracing() {
+                crate::native::log(&format!(
+                    "trace restore-fallback class={class} bounds={:?}",
+                    (bounds.left, bounds.top, bounds.right, bounds.bottom)
+                ));
+            }
+        }
+        if crate::native::tracing() {
+            let sx = copy.left + context.origin.0 - bounds.left;
+            let sy = copy.top + context.origin.1 - bounds.top;
+            crate::native::log(&format!(
+                "trace restore class={class} gdi={release} bounds={:?} copy={:?} src={:06x}/{:06x}/{:06x} dst={:06x}/{:06x}/{:06x}",
+                (bounds.left, bounds.top, bounds.right, bounds.bottom),
+                (copy.left, copy.top, copy.right, copy.bottom),
+                GetPixel(dc, sx + 10, sy + 10),
+                GetPixel(
+                    dc,
+                    sx + (copy.right - copy.left) / 2,
+                    sy + (copy.bottom - copy.top) / 2
+                ),
+                GetPixel(dc, sx + 30, sy + 30),
+                GetPixel(context.dc, copy.left + 10, copy.top + 10),
+                GetPixel(
+                    context.dc,
+                    (copy.left + copy.right) / 2,
+                    (copy.top + copy.bottom) / 2
+                ),
+                GetPixel(context.dc, copy.left + 30, copy.top + 30)
+            ));
         }
         let success = BitBlt(
             context.dc,
@@ -455,6 +491,184 @@ unsafe extern "system" fn restore_window(hwnd: HWND, data: LPARAM) -> i32 {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    #[ignore = "requires an unlocked desktop and Pyra stopped"]
+    fn child_owned_shell_surface_survives_overlay_feedback() -> Result<()> {
+        unsafe {
+            use crate::native::wide;
+            use windows_sys::Win32::System::LibraryLoader::GetModuleHandleW;
+            windows_sys::Win32::UI::HiDpi::SetProcessDpiAwarenessContext(
+                windows_sys::Win32::UI::HiDpi::DPI_AWARENESS_CONTEXT_PER_MONITOR_AWARE_V2,
+            );
+            let m = monitors()?[0];
+            let region = Monitor {
+                x: m.x + 80,
+                y: m.y + 80,
+                w: 320,
+                h: 200,
+            };
+            let class = wide("Progman");
+            let instance = GetModuleHandleW(null());
+            let wc = WNDCLASSW {
+                lpfnWndProc: Some(DefWindowProcW),
+                hInstance: instance,
+                lpszClassName: class.as_ptr(),
+                ..std::mem::zeroed()
+            };
+            ensure!(
+                RegisterClassW(&wc) != 0,
+                "register local shell fixture class"
+            );
+            let hwnd = CreateWindowExW(
+                WS_EX_TOPMOST | WS_EX_TOOLWINDOW | WS_EX_NOACTIVATE,
+                class.as_ptr(),
+                wide("Pyra shell capture test").as_ptr(),
+                WS_POPUP | WS_CLIPCHILDREN,
+                region.x,
+                region.y,
+                320,
+                200,
+                null_mut(),
+                null_mut(),
+                instance,
+                null(),
+            );
+            ensure!(!hwnd.is_null(), "create shell fixture");
+            struct Window(HWND);
+            impl Drop for Window {
+                fn drop(&mut self) {
+                    unsafe {
+                        DestroyWindow(self.0);
+                    }
+                }
+            }
+            let _window = Window(hwnd);
+            let child = CreateWindowExW(
+                0,
+                wide("STATIC").as_ptr(),
+                null(),
+                WS_CHILD | WS_VISIBLE | 6,
+                0,
+                0,
+                320,
+                200,
+                hwnd,
+                null_mut(),
+                instance,
+                null(),
+            );
+            ensure!(!child.is_null(), "create child-owned wallpaper surface");
+            ShowWindow(hwnd, SW_SHOWNOACTIVATE);
+            UpdateWindow(hwnd);
+            UpdateWindow(child);
+            #[link(name = "dwmapi")]
+            unsafe extern "system" {
+                fn DwmFlush() -> i32;
+            }
+            DwmFlush();
+            let dc = GetWindowDC(hwnd);
+            let raw = GetPixel(dc, 160, 100);
+            ReleaseDC(hwnd, dc);
+            println!("child-owned shell fixture raw parent pixel={raw:x}");
+            let mut capture = Capture::new(region)?;
+            capture.grab()?;
+            let baseline = capture.surface.pixels().to_vec();
+            ensure!(
+                baseline
+                    .as_chunks::<4>()
+                    .0
+                    .iter()
+                    .all(|p| p[..3] == [255, 255, 255]),
+                "child backdrop was not visible"
+            );
+            let mut overlay = crate::overlay::Overlay::new(region)?;
+            let bars = [Bar {
+                x: region.x as f32 + 160.,
+                y: region.y as f32 + 100.,
+                w: 220.,
+                h: 60.,
+                angle: 0.1,
+            }];
+            let mut cache = WindowCache::default();
+            for frame in 0..24 {
+                overlay.paint(&bars, true)?;
+                DwmFlush();
+                cache.begin_frame();
+                capture.grab_clean(&bars, &[overlay.handle()], &mut cache)?;
+                let altered = capture
+                    .surface
+                    .pixels()
+                    .as_chunks::<4>()
+                    .0
+                    .iter()
+                    .zip(baseline.as_chunks::<4>().0)
+                    .filter(|(a, b)| a[..3] != b[..3])
+                    .count();
+                ensure!(
+                    altered == 0,
+                    "shell reconstruction changed {altered} pixels at frame {frame}"
+                );
+            }
+            println!("24 child-owned shell feedback frames: zero altered pixels");
+        }
+        Ok(())
+    }
+
+    #[test]
+    #[ignore = "requires a stationary unlocked desktop and Pyra stopped"]
+    fn restored_desktop_matches_unbarred_composition() -> Result<()> {
+        unsafe {
+            windows_sys::Win32::UI::HiDpi::SetProcessDpiAwarenessContext(
+                windows_sys::Win32::UI::HiDpi::DPI_AWARENESS_CONTEXT_PER_MONITOR_AWARE_V2,
+            );
+        }
+        #[link(name = "dwmapi")]
+        unsafe extern "system" {
+            fn DwmFlush() -> i32;
+        }
+        let monitor = monitors()?[0];
+        let mut capture = Capture::new(monitor)?;
+        capture.grab()?;
+        let baseline = capture.surface.pixels().to_vec();
+        let mut overlay = crate::overlay::Overlay::new(monitor)?;
+        let mut cache = WindowCache::default();
+        let mut maximum_difference = 0f64;
+        for frame in 0..24 {
+            let bars = [Bar {
+                x: monitor.x as f32 + monitor.w as f32 * 0.45,
+                y: monitor.y as f32 + monitor.h as f32 * 0.3,
+                w: monitor.w as f32 * 0.8,
+                h: monitor.h as f32 * 0.4,
+                angle: if frame % 2 == 0 { 0. } else { 0.1 },
+            }];
+            overlay.paint(&bars, true)?;
+            unsafe {
+                DwmFlush();
+            }
+            cache.begin_frame();
+            capture.grab_clean(&bars, &[overlay.handle()], &mut cache)?;
+            let difference = capture
+                .surface
+                .pixels()
+                .as_chunks::<4>()
+                .0
+                .iter()
+                .zip(baseline.as_chunks::<4>().0)
+                .map(|(a, b)| (0..3).map(|c| a[c].abs_diff(b[c]) as u64).sum::<u64>())
+                .sum::<u64>() as f64
+                / (monitor.w * monitor.h * 3) as f64;
+            maximum_difference = maximum_difference.max(difference);
+            ensure!(
+                difference <= 2.,
+                "restoring overlays changed the desktop: frame={frame}, mean RGB error={difference:.2}"
+            );
+        }
+        println!(
+            "24 native desktop feedback frames: maximum mean RGB error={maximum_difference:.4}"
+        );
+        Ok(())
+    }
 
     #[test]
     #[ignore = "requires an unlocked desktop; checks the actual Explorer wallpaper surface"]
@@ -488,8 +702,11 @@ mod tests {
                 };
                 println!("shell {hwnd:?}: {m:?}");
                 let before = Surface::new(m.w, m.h)?;
-                let dc = GetWindowDC(hwnd);
-                ensure!(!dc.is_null(), "open Explorer window DC");
+                let mut cache = WindowCache::default();
+                cache.begin_frame();
+                let dc = cache
+                    .render(hwnd, &bounds)
+                    .ok_or_else(|| anyhow::anyhow!("render Explorer wallpaper surface"))?;
                 let first = BitBlt(before.dc, 0, 0, m.w as i32, m.h as i32, dc, 0, 0, SRCCOPY);
                 GdiFlush();
                 let mut overlay = crate::overlay::Overlay::new(m)?;
@@ -503,9 +720,12 @@ mod tests {
                 overlay.paint(&bars, true)?;
                 std::thread::sleep(std::time::Duration::from_millis(150));
                 let after = Surface::new(m.w, m.h)?;
+                cache.begin_frame();
+                let dc = cache
+                    .render(hwnd, &bounds)
+                    .ok_or_else(|| anyhow::anyhow!("render Explorer with overlay visible"))?;
                 let second = BitBlt(after.dc, 0, 0, m.w as i32, m.h as i32, dc, 0, 0, SRCCOPY);
                 GdiFlush();
-                ReleaseDC(hwnd, dc);
                 ensure!(first != 0 && second != 0, "capture Explorer window surface");
                 let delta = before
                     .pixels()
@@ -513,10 +733,10 @@ mod tests {
                     .zip(after.pixels())
                     .filter(|(a, b)| a != b)
                     .count();
-                println!("shell GDI changed bytes={delta}");
+                println!("shell rendered surface changed bytes={delta}");
                 ensure!(
                     delta == 0,
-                    "Explorer's window DC contains overlay pixels or the wallpaper changed during this static-desktop test"
+                    "Explorer's rendered surface contains overlay pixels or the wallpaper changed during this static-desktop test"
                 );
             }
         }

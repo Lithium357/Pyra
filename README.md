@@ -80,8 +80,11 @@ its physical rectangle after scaling or layout changes.
   desktop recordings include them**. Pyra's detector privately replaces each
   affected window's visible region from one coherent underlying window frame,
   preserving foreground occlusion and looking through transparent click-through
-  utility overlays. Hardware-accelerated browsers and common Qt/WPF applications use a
-  cached window-render fallback. Caches are shared across monitors and bounded
+  utility overlays. Explorer wallpaper, WinUI windows, hardware-accelerated browsers,
+  and common Qt/WPF applications use a cached complete-window render, including
+  child surfaces. Explorer's ordinary window DC can return invalid pixels despite
+  reporting a successful copy; those pixels previously triggered repeated scene
+  cuts and bar flicker on stationary wallpaper. Caches are shared across monitors and bounded
   to four reusable window bitmaps. No overlay is globally hidden from capture.
 - A capture of a specific application window can omit external overlay windows,
   including Pyra. Use desktop/display capture when the bars must be included.
@@ -166,7 +169,7 @@ DLL, and the OpenCV reference `lena.jpg` (not distributed with this repo):
 ```powershell
 $env:PYRA_RUNTIME = 'C:\absolute\path\onnxruntime.dll'
 $env:PYRA_TEST_IMAGE = 'C:\absolute\path\lena.jpg'
-cargo test --release --locked --bin pyra -- --include-ignored --skip browser_window_surface --nocapture --test-threads=1
+cargo test --release --locked --bin pyra -- --include-ignored --skip browser_window_surface --skip local_corpus --nocapture --test-threads=1
 ```
 
 Those tests check real-model eye coordinates, mixed-size faces, real-model
@@ -205,6 +208,17 @@ Pyra instances and keep the fixture visible when running it explicitly.
 redirected output. `--diagnostics` loads the model, runs blank-frame inference,
 enumerates displays, and writes the result to `data/pyra.log`. `--quit` asks the
 running tray instance to exit cleanly. `--background` suppresses the startup tip.
+
+`PYRA_TRACE=1` enables additional capture/tracking metadata for the first three
+minutes of a process. It records window classes, sampled pixel colors, bar geometry,
+scan counts and scene cuts in the existing bounded logs; it saves no images.
+Leave it unset for normal use.
+
+The ignored `child_owned_shell_surface_survives_overlay_feedback` test checks 24
+native overlay/restoration cycles over a child-painted shell fixture. The ignored
+`restored_desktop_matches_unbarred_composition` test compares 24 restored frames
+against the actual unbarred desktop, rather than comparing two potentially
+unreadable window DCs. Stop Pyra and keep the desktop stationary for these tests.
 
 ## Architecture
 

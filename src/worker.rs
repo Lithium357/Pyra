@@ -75,8 +75,10 @@ pub fn run(name: &str) -> Result<()> {
     let mut last_options = (u32::MAX, u32::MAX);
     let mut all_bars = Vec::new();
     let mut window_cache = WindowCache::default();
+    let mut next_trace = Instant::now();
     loop {
         let start = Instant::now();
+        let trace = native::tracing();
         shared.heartbeat.store(native::tick(), Ordering::Relaxed);
         let flags = Shared::read(&shared.flags);
         if flags & STOP != 0 {
@@ -163,7 +165,15 @@ pub fn run(name: &str) -> Result<()> {
             s.capture
                 .grab_clean(&all_bars, &handles, &mut window_cache)?;
             let image = s.capture.surface.image();
+            let before = s.tracker.tracks.len();
             let (changed, cut) = s.tracker.frame(&image, Instant::now());
+            if trace && (cut || before != s.tracker.tracks.len()) {
+                native::log(&format!(
+                    "trace motion monitor={:?} changed={changed} cut={cut} tracks={before}->{}",
+                    s.capture.monitor,
+                    s.tracker.tracks.len()
+                ));
+            }
             let tile_change = s.scanner.observe(&image, native::tick());
             s.changed = changed || tile_change;
             any_change |= changed || tile_change;
@@ -194,8 +204,18 @@ pub fn run(name: &str) -> Result<()> {
                     height: monitor.h,
                 };
                 if let Some(found) = s.tracker.project(&source, done.faces) {
+                    let before = s.tracker.tracks.len();
+                    let detected = found.len();
                     s.tracker.verify(&found, region, minimum);
+                    let verified = s.tracker.tracks.len();
                     s.tracker.update(found, Instant::now());
+                    if trace {
+                        native::log(&format!(
+                            "trace scan region={region:?} age_ms={} detections={detected} tracks={before}->{verified}->{}",
+                            captured.elapsed().as_millis(),
+                            s.tracker.tracks.len()
+                        ));
+                    }
                     if let Some((i, token)) = tile {
                         s.scanner.completed(i, token, native::tick());
                     }
@@ -282,6 +302,32 @@ pub fn run(name: &str) -> Result<()> {
             if start >= next_reassert {
                 s.overlay.reassert();
             }
+        }
+        if trace && start >= next_trace {
+            for s in &screens {
+                let state: Vec<_> = s
+                    .tracker
+                    .tracks
+                    .iter()
+                    .take(8)
+                    .map(|t| {
+                        (
+                            t.face.bar(1., 1.),
+                            t.face.eye_count,
+                            t.face.score,
+                            t.face.detail,
+                        )
+                    })
+                    .collect();
+                native::log(&format!(
+                    "trace frame mode={mode} threshold={threshold} monitor={:?} changed={} cycle_ms={} bars={} state={state:?}",
+                    s.capture.monitor,
+                    s.changed,
+                    start.elapsed().as_millis(),
+                    s.bars.len()
+                ));
+            }
+            next_trace = start + Duration::from_millis(250);
         }
         if start >= next_reassert {
             next_reassert = start + Duration::from_secs(1);
