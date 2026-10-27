@@ -48,7 +48,7 @@ The tray menu offers:
 | Balanced | Overlapping 800-pixel local regions, supplementary overview scans, and high-resolution checks of tracked faces; target 20 capture/tracking cycles/s. |
 | More detail | 640-pixel local regions and 640-pixel anime inference; target 25 capture/tracking cycles/s. |
 | Low power | 1280-pixel regions and 384-pixel anime inference; target 10 capture/tracking cycles/s. Small faces are more likely to be missed. |
-| Sensitivity | Lower model confidence catches more faces, with more false positives. |
+| Sensitivity | Default: Slightly more (60% confidence), a small reduction from Balanced (65%). Lower confidence catches more faces, with more false positives. |
 | Bar width/thickness | Adjusts only the eye bar; never switches to full-face masks. |
 | Start when I sign in | Opt-in current-user startup entry. Disable before moving/deleting the portable folder. |
 

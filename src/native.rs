@@ -241,7 +241,7 @@ impl Default for Config {
     fn default() -> Self {
         Self {
             mode: 0,
-            threshold: 65,
+            threshold: 60,
             width: 100,
             thickness: 100,
             startup: false,
@@ -499,7 +499,12 @@ impl Controller {
                     &[80, 100, 130, 165][..],
                     self.config.thickness,
                 ),
-                (400, "Sensitivity", &[80, 65, 50][..], self.config.threshold),
+                (
+                    400,
+                    "Sensitivity",
+                    &[80, 65, 60, 50][..],
+                    self.config.threshold,
+                ),
             ] {
                 let submenu = CreatePopupMenu();
                 for (i, &v) in values.iter().enumerate() {
@@ -507,6 +512,7 @@ impl Controller {
                         [
                             "Conservative",
                             "Balanced",
+                            "Slightly more",
                             "Catch more (more false positives)",
                         ][i]
                             .into()
@@ -553,7 +559,7 @@ impl Controller {
             100..=102 => self.config.mode = (id - 100) as u32,
             200..=203 => self.config.width = [90, 100, 120, 145][id - 200],
             300..=303 => self.config.thickness = [80, 100, 130, 165][id - 300],
-            400..=402 => self.config.threshold = [80, 65, 50][id - 400],
+            400..=403 => self.config.threshold = [80, 65, 60, 50][id - 400],
             ID_STARTUP => {
                 let desired = !self.config.startup;
                 match startup(desired) {
@@ -572,7 +578,7 @@ impl Controller {
                 );
             },
             ID_ABOUT => unsafe {
-                MessageBoxW(self.hwnd, wide("Pyra 0.3.3\nLocal automatic eye bars across all displays.\n\nCtrl+Alt+B: pause/resume\nCtrl+Alt+O: tray menu\n\nNo screenshots are saved or uploaded.\nSmall/profile faces and fast cuts may be missed.\nUse borderless/windowed mode for fullscreen apps.\n\nRust + native Windows APIs + local real/anime face and eye models.\nGPL-3.0. See README for testing and limits.").as_ptr(), wide("About Pyra").as_ptr(), MB_OK | MB_ICONINFORMATION);
+                MessageBoxW(self.hwnd, wide("Pyra 0.3.4\nLocal automatic eye bars across all displays.\n\nCtrl+Alt+B: pause/resume\nCtrl+Alt+O: tray menu\n\nNo screenshots are saved or uploaded.\nSmall/profile faces and fast cuts may be missed.\nUse borderless/windowed mode for fullscreen apps.\n\nRust + native Windows APIs + local real/anime face and eye models.\nGPL-3.0. See README for testing and limits.").as_ptr(), wide("About Pyra").as_ptr(), MB_OK | MB_ICONINFORMATION);
             },
             _ => return,
         }
