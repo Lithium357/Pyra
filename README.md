@@ -16,6 +16,11 @@ Fast vertical movement uses a wider scroll search when a local match fails.
 Verified scroll motion guides other faces on the same page, while fixed faces
 keep their own stationary match. Detector results are moved from their captured
 frame to the current frame before bars are updated.
+On unchanged content, confirmed anime faces retain their bars through contradictory
+negative scans and temporary one-eye results. A profile bar anchors to the visible
+eye; sideways eye pairs retain their actual tilt. Rejected weak candidates are
+cached in a bounded list until their pixels change or stronger evidence arrives,
+preventing the same static false candidate from repeatedly flashing back on.
 
 Every bar displays **[censored]** in white Doto text, centered and rotated with
 the bar. The font is embedded and loaded privately; no font installation or

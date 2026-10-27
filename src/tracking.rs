@@ -86,6 +86,7 @@ pub struct Track {
     missed_checks: u8,
     weak_eyes: u8,
     appearance_changed: bool,
+    stable_evidence: bool,
 }
 
 fn tracking_scale(width: usize, height: usize) -> f32 {
@@ -99,6 +100,12 @@ pub struct Tracker {
     pub tracks: Vec<Track>,
     previous: Gray,
     current: Gray,
+    rejected: Vec<Face>,
+    image_size: (usize, usize),
+}
+
+fn reliable_face(f: &Face) -> bool {
+    f.eye_count > 0 && ((f.eye_band > 0. && f.score >= 0.7) || f.score >= 0.9)
 }
 
 impl Tracker {
@@ -143,6 +150,7 @@ impl Tracker {
     /// Track translation with sparse patch matching between full detections.
     /// Buffers and patch sample arrays are reused; no video history is retained.
     pub fn frame(&mut self, image: &Image<'_>, now: Instant) -> (bool, bool) {
+        self.image_size = (image.width, image.height);
         self.current.fill(image);
         let mut cut = self.current.w != self.previous.w || self.current.h != self.previous.h;
         let mut changed = cut;
@@ -155,6 +163,12 @@ impl Tracker {
                 changes += usize::from(diff > 8);
             }
             changed = changes > 3;
+            if changed {
+                let sx = self.current.w as f32 / image.width as f32;
+                let sy = self.current.h as f32 / image.height as f32;
+                self.rejected
+                    .retain(|f| !patch_changed(&self.previous, &self.current, f, sx, sy));
+            }
             cut = sum as f64 / self.current.pixels.len().max(1) as f64 > 38.;
             let sx = self.current.w as f32 / image.width as f32;
             let sy = self.current.h as f32 / image.height as f32;
@@ -238,6 +252,7 @@ impl Tracker {
         }
         if cut {
             self.tracks.clear();
+            self.rejected.clear();
         }
         self.tracks.retain(|t| {
             now.duration_since(t.seen) < Duration::from_millis(400)
@@ -260,6 +275,8 @@ impl Tracker {
                 .max_by(|a, b| a.1.total_cmp(&b.1));
             if let Some((i, _)) = best {
                 let old = &self.tracks[i].face;
+                let stable_evidence =
+                    self.tracks[i].stable_evidence || (reliable_face(old) && reliable_face(&face));
                 // A low-resolution overview is evidence that the face remains,
                 // but must not replace landmarks refined by a close local scan.
                 // Keep tracking its current frame position until a comparably
@@ -268,14 +285,16 @@ impl Tracker {
                     && (face.detail < old.detail * 0.6
                         || (!self.tracks[i].appearance_changed
                             && !self.previous.pixels.is_empty()
-                            && face.eye_count == old.eye_count
-                            && face.detail <= old.detail * 1.15))
+                            && (face.eye_count < old.eye_count
+                                || (face.eye_count == old.eye_count
+                                    && face.detail <= old.detail * 1.15))))
                 {
                     let track = &mut self.tracks[i];
                     track.seen = now;
                     track.detected = now;
                     track.confirmed = now;
                     track.missed_checks = 0;
+                    track.stable_evidence = stable_evidence;
                     matched[i] = true;
                     continue;
                 }
@@ -310,6 +329,7 @@ impl Tracker {
                         eye[1] = eye[1] * 0.8 + prior[1] * 0.2;
                     }
                 }
+                let pending_profile = weak_eyes > 0 && face.eye_count == old.eye_count;
                 self.tracks[i] = Track {
                     face,
                     seen: now,
@@ -317,12 +337,23 @@ impl Tracker {
                     confirmed: now,
                     missed_checks: 0,
                     weak_eyes,
-                    appearance_changed: false,
+                    appearance_changed: pending_profile,
+                    stable_evidence,
                 };
                 matched[i] = true;
             } else if self.tracks.len() < 512
                 && self.tracks.iter().all(|t| !t.face.same_face(&face))
             {
+                if self.rejected.iter().any(|old| {
+                    old.same_face(&face)
+                        && !(reliable_face(&face)
+                            && (!reliable_face(old)
+                                || face.detail > old.detail * 1.5
+                                || face.score > old.score + 0.1))
+                }) {
+                    continue;
+                }
+                self.rejected.retain(|old| !old.same_face(&face));
                 self.tracks.push(Track {
                     face,
                     seen: now,
@@ -331,6 +362,7 @@ impl Tracker {
                     missed_checks: 0,
                     weak_eyes: 0,
                     appearance_changed: false,
+                    stable_evidence: false,
                 });
             }
         }
@@ -342,7 +374,14 @@ impl Tracker {
     pub fn verify(&mut self, detections: &[Face], region: Region, minimum_width: f32) {
         self.verify_at(detections, region, minimum_width, Instant::now());
     }
-    fn verify_at(&mut self, detections: &[Face], region: Region, minimum_width: f32, now: Instant) {
+    pub(crate) fn verify_at(
+        &mut self,
+        detections: &[Face],
+        region: Region,
+        minimum_width: f32,
+        now: Instant,
+    ) {
+        let has_frame = !self.previous.pixels.is_empty();
         for track in &mut self.tracks {
             let f = &track.face;
             if f.w >= minimum_width
@@ -350,6 +389,13 @@ impl Tracker {
                 && f.y >= region.y as f32
                 && f.x + f.w <= (region.x + region.w) as f32
                 && f.y + f.h <= (region.y + region.h) as f32
+                && (self.image_size.0 == 0
+                    || crate::detection::complete_in_region(
+                        f,
+                        region,
+                        self.image_size.0,
+                        self.image_size.1,
+                    ))
             {
                 if detections
                     .iter()
@@ -357,7 +403,7 @@ impl Tracker {
                 {
                     track.missed_checks = 0;
                     track.confirmed = now;
-                } else {
+                } else if !(has_frame && track.stable_evidence && !track.appearance_changed) {
                     track.missed_checks = track.missed_checks.saturating_add(1);
                 }
             }
@@ -365,7 +411,19 @@ impl Tracker {
         // Fast overlapping tiles can disagree within one frame. Require a short
         // confirmation grace period as well as negative checks to avoid flashing.
         self.tracks.retain(|t| {
-            t.missed_checks < 2 || now.duration_since(t.confirmed) < Duration::from_millis(700)
+            let keep =
+                t.missed_checks < 2 || now.duration_since(t.confirmed) < Duration::from_millis(700);
+            if !keep
+                && has_frame
+                && !t.appearance_changed
+                && self.rejected.iter().all(|f| !f.same_face(&t.face))
+            {
+                if self.rejected.len() == 128 {
+                    self.rejected.remove(0);
+                }
+                self.rejected.push(t.face.clone());
+            }
+            keep
         });
     }
 }
@@ -559,6 +617,223 @@ fn displacement(
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn internal_scan_edge_cannot_negatively_verify_a_face() {
+        let now = Instant::now();
+        let mut tracker = Tracker::default();
+        tracker.frame(
+            &Image {
+                pixels: &vec![128; 800 * 800 * 4],
+                width: 800,
+                height: 800,
+            },
+            now,
+        );
+        tracker.update(
+            vec![Face {
+                x: 500.,
+                y: 200.,
+                w: 99.,
+                h: 100.,
+                eyes: [[525., 230.], [570., 230.]],
+                score: 0.7,
+                eye_count: 2,
+                detail: 100.,
+                eye_band: 0.,
+            }],
+            now,
+        );
+        let edge = Region {
+            x: 0,
+            y: 0,
+            w: 600,
+            h: 800,
+        };
+        tracker.verify_at(&[], edge, 0., now + Duration::from_secs(1));
+        tracker.verify_at(&[], edge, 0., now + Duration::from_secs(2));
+        assert_eq!(
+            tracker.tracks.len(),
+            1,
+            "scan-edge exclusion counted as negative evidence"
+        );
+        let full = Region { w: 800, ..edge };
+        tracker.verify_at(&[], full, 0., now + Duration::from_secs(3));
+        tracker.verify_at(&[], full, 0., now + Duration::from_secs(4));
+        assert!(
+            tracker.tracks.is_empty(),
+            "an authoritative negative could not remove a weak candidate"
+        );
+    }
+    #[test]
+    fn rejected_static_candidate_stays_rejected_until_pixels_or_evidence_improve() {
+        let now = Instant::now();
+        let mut pixels = vec![128; 200 * 200 * 4];
+        let face = Face {
+            x: 40.,
+            y: 40.,
+            w: 100.,
+            h: 100.,
+            eyes: [[65., 70.], [115., 80.]],
+            score: 0.7,
+            eye_count: 2,
+            detail: 100.,
+            eye_band: 0.,
+        };
+        let full = Region {
+            x: 0,
+            y: 0,
+            w: 200,
+            h: 200,
+        };
+        let mut tracker = Tracker::default();
+        tracker.frame(
+            &Image {
+                pixels: &pixels,
+                width: 200,
+                height: 200,
+            },
+            now,
+        );
+        tracker.update(vec![face.clone()], now);
+        tracker.verify_at(&[], full, 0., now + Duration::from_millis(100));
+        tracker.verify_at(&[], full, 0., now + Duration::from_millis(800));
+        assert!(tracker.tracks.is_empty());
+        for n in 1..=4 {
+            tracker.update(
+                vec![face.clone()],
+                now + Duration::from_millis(800 + n * 100),
+            );
+        }
+        assert!(
+            tracker.tracks.is_empty(),
+            "rejected static candidate repeatedly reappeared"
+        );
+        let mut stronger = face.clone();
+        stronger.eye_band = 34.;
+        stronger.score = 0.85;
+        tracker.update(vec![stronger], now + Duration::from_millis(1300));
+        assert_eq!(
+            tracker.tracks.len(),
+            1,
+            "better face and eye evidence stayed rejected"
+        );
+        tracker.tracks.clear();
+        tracker.rejected.push(face.clone());
+        for y in 40..140 {
+            for x in 40..140 {
+                pixels[(y * 200 + x) * 4..(y * 200 + x) * 4 + 3].fill(140);
+            }
+        }
+        tracker.frame(
+            &Image {
+                pixels: &pixels,
+                width: 200,
+                height: 200,
+            },
+            now + Duration::from_millis(1400),
+        );
+        tracker.update(vec![face], now + Duration::from_millis(1400));
+        assert_eq!(
+            tracker.tracks.len(),
+            1,
+            "changed content could not acquire a new track"
+        );
+        assert!(tracker.rejected.is_empty());
+    }
+    #[test]
+    fn confirmed_static_anime_face_survives_contradictory_scans_until_pixels_change() {
+        let now = Instant::now();
+        let mut pixels = vec![128; 200 * 200 * 4];
+        let f = Face {
+            x: 40.,
+            y: 40.,
+            w: 100.,
+            h: 100.,
+            eyes: [[65., 70.], [115., 80.]],
+            score: 0.8,
+            eye_count: 2,
+            detail: 100.,
+            eye_band: 34.,
+        };
+        let mut tracker = Tracker::default();
+        tracker.frame(
+            &Image {
+                pixels: &pixels,
+                width: 200,
+                height: 200,
+            },
+            now,
+        );
+        tracker.update(vec![f.clone()], now);
+        tracker.update(vec![f.clone()], now + Duration::from_millis(50));
+        let full = Region {
+            x: 0,
+            y: 0,
+            w: 200,
+            h: 200,
+        };
+        tracker.verify_at(&[], full, 0., now + Duration::from_secs(1));
+        tracker.verify_at(&[], full, 0., now + Duration::from_secs(2));
+        assert_eq!(
+            tracker.tracks.len(),
+            1,
+            "unchanged confirmed face blinked out"
+        );
+        let mut one_eye = f.clone();
+        one_eye.eye_count = 1;
+        one_eye.eyes = [f.eyes[1]; 2];
+        one_eye.detail = 200.;
+        for n in 1..=4 {
+            tracker.update(vec![one_eye.clone()], now + Duration::from_millis(n * 50));
+        }
+        assert_eq!(
+            tracker.tracks[0].face.eye_count, 2,
+            "stationary eyes toggled between two and one"
+        );
+        for y in 40..140 {
+            for x in 40..140 {
+                pixels[(y * 200 + x) * 4..(y * 200 + x) * 4 + 3].fill(140);
+            }
+        }
+        tracker.frame(
+            &Image {
+                pixels: &pixels,
+                width: 200,
+                height: 200,
+            },
+            now + Duration::from_millis(250),
+        );
+        for n in 1..=3 {
+            tracker.update(
+                vec![one_eye.clone()],
+                now + Duration::from_millis(250 + n * 50),
+            );
+        }
+        assert_eq!(
+            tracker.tracks[0].face.eye_count, 1,
+            "a real profile change was frozen"
+        );
+        // A later changed patch releases persistence for negative verification.
+        for y in 40..140 {
+            for x in 40..140 {
+                pixels[(y * 200 + x) * 4..(y * 200 + x) * 4 + 3].fill(150);
+            }
+        }
+        tracker.frame(
+            &Image {
+                pixels: &pixels,
+                width: 200,
+                height: 200,
+            },
+            now + Duration::from_millis(450),
+        );
+        tracker.verify_at(&[], full, 0., now + Duration::from_millis(500));
+        tracker.verify_at(&[], full, 0., now + Duration::from_millis(1200));
+        assert!(
+            tracker.tracks.is_empty(),
+            "changed background retained a stale bar"
+        );
+    }
     #[test]
     fn dense_page_scrolls_preserve_tracks_and_project_delayed_detections() {
         let page = |shift: i32| {

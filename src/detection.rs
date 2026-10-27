@@ -58,8 +58,10 @@ impl Face {
         let distance = dx.hypot(dy);
         let mut angle = dy.atan2(dx);
         let mut x = (a[0] + b[0]) * 0.5;
-        if distance < self.w * 0.12 || angle.abs() > 1.14 {
-            x = self.x + self.w * 0.5;
+        if distance < self.w * 0.12 {
+            if self.eye_count != 1 {
+                x = self.x + self.w * 0.5;
+            }
             angle = 0.;
         }
         Bar {
@@ -265,7 +267,7 @@ impl Detector {
     }
 }
 
-fn complete_in_region(face: &Face, region: Region, width: usize, height: usize) -> bool {
+pub(crate) fn complete_in_region(face: &Face, region: Region, width: usize, height: usize) -> bool {
     let mx = (face.w * 0.03).max(3.);
     let my = (face.h * 0.03).max(3.);
     (region.x == 0 || face.x > region.x as f32 + mx)
@@ -380,6 +382,40 @@ mod tests {
             110,
             140
         ));
+    }
+    #[test]
+    fn profile_bar_anchors_to_eye_and_sideways_bar_covers_vertical_eyes() {
+        let mut face = Face {
+            x: 20.,
+            y: 20.,
+            w: 100.,
+            h: 140.,
+            eyes: [[105., 55.], [105., 55.]],
+            score: 0.9,
+            eye_count: 1,
+            detail: 100.,
+            eye_band: 30.,
+        };
+        let b = face.bar(1., 1.);
+        assert_eq!(b.x, 105.);
+        face.x -= 12.;
+        face.w += 20.;
+        assert_eq!(
+            face.bar(1., 1.).x,
+            b.x,
+            "profile bar followed uncertain face box"
+        );
+        face.eye_count = 2;
+        face.eyes = [[65., 40.], [68., 130.]];
+        let b = face.bar(1., 1.);
+        assert!(b.angle > 1.4);
+        let (sin, cos) = b.angle.sin_cos();
+        for eye in face.eyes {
+            let (dx, dy) = (eye[0] - b.x, eye[1] - b.y);
+            assert!(
+                (dx * cos + dy * sin).abs() <= b.w / 2. && (-dx * sin + dy * cos).abs() <= b.h / 2.
+            );
+        }
     }
     #[test]
     fn tiles_cover_odd_and_negative_origin_independent_displays() {

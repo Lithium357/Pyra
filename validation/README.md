@@ -84,3 +84,23 @@ with `--ignored --nocapture` on a stationary, unlocked desktop with Pyra stopped
 Neither these short runs nor CI establish months of uptime or correctness on
 every monitor/DPI/GPU combination. Legacy Lenna tests remain for geometry and
 capture regressions; they are not the main evidence of detection quality.
+
+## Private local collections
+
+`private_validation::anime_scan_stability` is an opt-in local diagnostic, outside
+the CI validation group. Set `PYRA_PRIVATE_MANIFEST` to a UTF-8 file with one local
+image path per line, `PYRA_PRIVATE_REPORT` to a local output directory, and
+`PYRA_RUNTIME` to the runtime DLL. `PYRA_PRIVATE_LIMIT` defaults to 128 images;
+`PYRA_PRIVATE_START` selects a later portion of the manifest.
+
+The diagnostic fits each still image into a 1920×1080 scene and repeatedly scans
+overview, overlapping tiles and face regions without changing any source pixels.
+It logs track removals, additions and bar-center jumps over 3 pixels after initial
+acquisition. One-time improvements from more detailed landmarks count as jumps
+too; these metrics measure temporal behavior, not ground-truth detection accuracy.
+False positives can be among the reported candidates. Only narrow eye-area crops
+of illustrated detections are exported for inspection, with numeric filenames.
+It never exports complete input images or source paths to the report.
+
+Inputs, manifests, crops and reports must stay outside the repository and CI
+artifacts. The portable application contains none of this test data or test code.

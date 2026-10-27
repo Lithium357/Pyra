@@ -6,6 +6,8 @@ mod detection;
 mod label;
 mod native;
 mod overlay;
+#[cfg(test)]
+mod private_validation;
 mod scanning;
 mod stylized;
 mod tracking;
