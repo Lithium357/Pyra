@@ -1,31 +1,48 @@
-# Pyra
+<h1 align="center">Pyra</h1>
 
-Automatic live **eye bars** on faces across your Windows desktop. Run it once;
-it detects faces, tracks their motion, and draws tilted black bars through the
-eyes without clicking individual faces. The application is written in Rust.
-There is no Python runtime, browser shell, web service, or network code.
+<p align="center">
+  <strong>Live eye bars for real faces, anime, and illustrated characters.</strong><br>
+  Native Rust. Local inference. No clicking individual faces.
+</p>
 
-Real faces use YuNet; anime and illustrated faces also use dedicated face and
-eye models. Bars follow detected eyes, including a single visible eye in a
-profile, rather than assuming the eyes occupy a fixed part of a face box.
-Faces cut off by an internal scan tile are left to overlapping tiles and overview
-scans, preventing a large wallpaper face from becoming several partial tracks.
-Repeated scans preserve bar geometry on unchanged face pixels; higher-resolution
-refinements and changes inside the face can still update the eye placement.
-Fast vertical movement uses a wider scroll search when a local match fails.
-Verified scroll motion guides other faces on the same page, while fixed faces
-keep their own stationary match. Detector results are moved from their captured
-frame to the current frame before bars are updated.
-On unchanged content, confirmed anime faces retain their bars through contradictory
-negative scans and temporary one-eye results. A profile bar anchors to the visible
-eye; sideways eye pairs retain their actual tilt. Rejected weak candidates are
-cached in a bounded list until their pixels change or stronger evidence arrives,
-preventing the same static false candidate from repeatedly flashing back on.
+<p align="center">
+  <a href="https://github.com/Lithium357/Pyra/actions/workflows/windows.yml"><img src="https://github.com/Lithium357/Pyra/actions/workflows/windows.yml/badge.svg?branch=main" alt="Windows build and validation"></a>
+  <img src="https://img.shields.io/badge/platform-Windows_10%2F11-c4a7e7?style=flat-square" alt="Windows 10 and 11">
+  <img src="https://img.shields.io/badge/language-Rust-dea584?style=flat-square" alt="Written in Rust">
+  <a href="LICENSE"><img src="https://img.shields.io/badge/license-GPL--3.0-a6bda5?style=flat-square" alt="GPL-3.0 license"></a>
+</p>
 
-Every bar displays **[censored]** in white Doto text, centered and rotated with
-the bar. The font is embedded and loaded privately; no font installation or
-network access is needed. A reusable prefiltered label bitmap scales to fit
-each bar without changing its eye coverage. Very small bars have tiny labels.
+<p align="center">
+  <a href="#get-a-build">Get a build</a> ·
+  <a href="#run">Quick start</a> ·
+  <a href="#build-from-source">Build from source</a> ·
+  <a href="validation/README.md">Validation</a> ·
+  <a href="#privacy-and-limits">Limits</a>
+</p>
+
+---
+
+Pyra detects faces across your Windows desktop, tracks their movement, and places
+black bars through their eyes. Every bar reads **[censored]** in white **Doto**,
+centered and rotated with the eyes. The font and models are embedded.
+
+| Feature | What you get |
+|---|---|
+| **Human + anime** | Real-face, illustrated-face, and anime-eye models work together, including single-eye profiles. |
+| **Across displays** | Automatic monitor detection, ultrawide and portrait layouts, and displays above or left of the primary monitor. |
+| **Screenshots included** | Desktop screenshots and recordings include the overlay. Windows remain clickable underneath. |
+| **Entirely local** | No accounts, uploads, network code, Python runtime, or browser shell. |
+| **Built to keep running** | Bounded queues and caches, a supervised worker, crash recovery, and sleep/display-change handling. |
+
+Detection is best-effort: small or obscured faces and fast cuts can be missed.
+See [privacy and limits](#privacy-and-limits) before relying on it for redaction.
+
+## Get a build
+
+Open the [Windows build workflow](https://github.com/Lithium357/Pyra/actions/workflows/windows.yml?query=branch%3Amain),
+choose the latest successful **main** run, and download **Pyra-windows-x64** from
+its **Artifacts** section. GitHub requires you to sign in to download artifacts.
+Extract the ZIP and follow the quick start below.
 
 ## Run
 
@@ -52,6 +69,26 @@ The tray menu offers:
 | Bar width/thickness | Adjusts only the eye bar; never switches to full-face masks. |
 | Start when I sign in | Opt-in current-user startup entry. Disable before moving/deleting the portable folder. |
 
+<details>
+<summary>How scanning, tracking, and monitor layouts work</summary>
+
+Real faces use YuNet; anime and illustrated faces also use dedicated face and
+eye models. Bars follow detected eyes, including a single visible eye in a
+profile, rather than assuming the eyes occupy a fixed part of a face box.
+Faces cut off by an internal scan tile are left to overlapping tiles and overview
+scans, preventing a large wallpaper face from becoming several partial tracks.
+Repeated scans preserve bar geometry on unchanged face pixels; higher-resolution
+refinements and changes inside the face can still update the eye placement.
+Fast vertical movement uses a wider scroll search when a local match fails.
+Verified scroll motion guides other faces on the same page, while fixed faces
+keep their own stationary match. Detector results are moved from their captured
+frame to the current frame before bars are updated.
+On unchanged content, confirmed anime faces retain their bars through contradictory
+negative scans and temporary one-eye results. A profile bar anchors to the visible
+eye; sideways eye pairs retain their actual tilt. Rejected weak candidates are
+cached in a bounded list until their pixels change or stronger evidence arrives,
+preventing the same static false candidate from repeatedly flashing back on.
+
 These are scheduling targets, not guaranteed frame rates. Multiple monitors,
 large windows, and busy screens increase cycle time. Per-region fingerprints
 keep changed regions pending until scanned, even if content immediately becomes
@@ -70,6 +107,8 @@ axis, bounded at 2560 pixels on the long axis. Monitor positions remain signed
 physical pixel coordinates, including displays above/left of the primary display.
 Mirrored monitor rectangles are deduplicated. Overlay geometry is reasserted to
 its physical rectangle after scaling or layout changes.
+
+</details>
 
 ## Privacy and limits
 
@@ -240,6 +279,10 @@ High-refresh 4K multi-monitor use would benefit from a future asynchronous GPU
 window-capture backend and GPU composition. Switching to
 Rust removes interpreter/UI-framework overhead; it does not make model inference
 or desktop copies free.
+
+The Doto font is loaded privately without installing it on the system. A reusable
+prefiltered label bitmap scales with each bar while preserving eye coverage.
+Very small bars have tiny labels.
 
 ## License
 
