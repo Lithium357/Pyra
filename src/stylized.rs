@@ -110,32 +110,42 @@ impl Stylized {
         let eyes = run(&mut self.eye, &self.input, side, region, 0.25)?;
         let mut result = Vec::new();
         for mut face in boxes {
-            let mut contained: Vec<_> = eyes
-                .iter()
-                .filter(|e| {
-                    let (x, y) = (e.x + e.w * 0.5, e.y + e.h * 0.5);
-                    x >= face.x
-                        && x <= face.x + face.w
-                        && y >= face.y
-                        && y <= face.y + face.h * 0.85
-                })
-                .collect();
-            contained.sort_unstable_by(|a, b| b.score.total_cmp(&a.score));
-            if !contained.is_empty() {
-                let a = contained[0];
-                let b = *contained.get(1).unwrap_or(&a);
-                face.eye_count = contained.len().min(2) as u8;
-                // Illustrated eyes occupy more of the face than human eyes.
-                // Keep their height plus a modest localization margin covered.
-                face.eye_band = (a.h.max(b.h) * 1.4).max(face.h * 0.34);
-                face.eyes = [
-                    [a.x + a.w * 0.5, a.y + a.h * 0.5],
-                    [b.x + b.w * 0.5, b.y + b.h * 0.5],
-                ];
+            if associate_eyes(&mut face, &eyes) {
                 result.push(face);
             }
         }
         Ok(suppress(result))
+    }
+}
+
+fn associate_eyes(face: &mut Face, eyes: &[Face]) -> bool {
+    let mut contained: Vec<_> = eyes
+        .iter()
+        .filter(|e| {
+            let (x, y) = (e.x + e.w * 0.5, e.y + e.h * 0.5);
+            x >= face.x && x <= face.x + face.w && y >= face.y && y <= face.y + face.h
+        })
+        .collect();
+    contained.sort_unstable_by(|a, b| b.score.total_cmp(&a.score));
+    if !contained.is_empty() {
+        let a = contained[0];
+        let b = *contained.get(1).unwrap_or(&a);
+        face.eye_count = contained.len().min(2) as u8;
+        // Illustrated eyes occupy more of the face than human eyes.
+        // Keep their height plus a modest localization margin covered.
+        face.eyes = [
+            [a.x + a.w * 0.5, a.y + a.h * 0.5],
+            [b.x + b.w * 0.5, b.y + b.h * 0.5],
+        ];
+        let angle = (face.eyes[1][1] - face.eyes[0][1]).atan2(face.eyes[1][0] - face.eyes[0][0]);
+        let (sin, cos) = angle.sin_cos();
+        // Eye boxes are axis-aligned. Project their full extents onto
+        // the rotated bar's thickness axis, not just screen-space Y.
+        let extent = |eye: &Face| eye.w * sin.abs() + eye.h * cos.abs();
+        face.eye_band = (extent(a).max(extent(b)) * 1.4).max(face.h * 0.34);
+        true
+    } else {
+        false
     }
 }
 
@@ -181,4 +191,57 @@ fn run(
         }
     }
     Ok(suppress(found))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    #[test]
+    fn steep_pairs_include_lower_eye_and_cover_eye_box_corners() {
+        let mut face = Face {
+            x: 0.,
+            y: 0.,
+            w: 200.,
+            h: 120.,
+            eyes: [[0.; 2]; 2],
+            score: 0.95,
+            eye_count: 0,
+            detail: 200.,
+            eye_band: 0.,
+        };
+        let eyes: Vec<_> = [[70., 35.], [110., 108.]]
+            .into_iter()
+            .map(|[x, y]| Face {
+                x: x - 32.,
+                y: y - 8.,
+                w: 64.,
+                h: 16.,
+                eyes: [[0.; 2]; 2],
+                score: 0.9,
+                eye_count: 0,
+                detail: 64.,
+                eye_band: 0.,
+            })
+            .collect();
+        assert!(associate_eyes(&mut face, &eyes));
+        assert_eq!(face.eye_count, 2, "lower eye was discarded");
+        let bar = face.bar(1., 1.);
+        assert!(bar.angle.abs() > 1., "steep pair became horizontal");
+        let (sin, cos) = bar.angle.sin_cos();
+        for eye in eyes {
+            for x in [eye.x, eye.x + eye.w] {
+                for y in [eye.y, eye.y + eye.h] {
+                    let (dx, dy) = (x - bar.x, y - bar.y);
+                    assert!(
+                        (-dx * sin + dy * cos).abs() <= bar.h / 2.,
+                        "rotated thickness missed eye corner"
+                    );
+                    assert!(
+                        (dx * cos + dy * sin).abs() <= bar.w / 2.,
+                        "bar length missed eye corner"
+                    );
+                }
+            }
+        }
+    }
 }

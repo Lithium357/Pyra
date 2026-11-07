@@ -50,6 +50,11 @@ cargo test --release --locked --bin pyra validation:: -- --ignored --nocapture -
   reduce real-photo eye coverage compared with YuNet-only.
 - `varied_anime_motion` moves three different characters, including glasses and
   a profile, through 90 frames with periodic fresh detection.
+- `steep_anime_tilt` rotates three manually annotated anime portraits through
+  nine orientations from −75° to +75°. It writes per-case eye-center coverage,
+  eye count, and angle error to `steep-tilt.csv`. These are transformed variants
+  of three source portraits, not 27 independent images. Missing faces and wrong
+  eye pairs remain visible in the report.
 - `asynchronous_anime_motion` runs the actual bounded inference thread against
   120 moving 1920×1080 frames at a 50 ms cadence, alternating overview, tile and
   close-up scans. After 40 warmup frames it requires at least 98% eye-center

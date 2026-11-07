@@ -58,7 +58,9 @@ impl Face {
         let distance = dx.hypot(dy);
         let mut angle = dy.atan2(dx);
         let mut x = (a[0] + b[0]) * 0.5;
-        if distance < self.w * 0.12 {
+        // A narrow/profile-like pair can still establish a steep eye line.
+        // Face-box width is not a valid reason to flatten two distinct eyes.
+        if self.eye_count < 2 || distance < 1. {
             if self.eye_count != 1 {
                 x = self.x + self.w * 0.5;
             }
@@ -105,6 +107,7 @@ pub struct Detector {
     session: Session,
     input: Vec<f32>,
     stylized: crate::stylized::Stylized,
+    roll_pixels: Vec<u8>,
 }
 
 impl Detector {
@@ -128,6 +131,7 @@ impl Detector {
             session,
             input: vec![0.; 3 * INPUT * INPUT],
             stylized: crate::stylized::Stylized::new()?,
+            roll_pixels: Vec::new(),
         })
     }
 
@@ -149,6 +153,7 @@ impl Detector {
                 found.push(face);
             }
         }
+        self.refine_uncertain_roll(image, &mut found)?;
         // A tile can turn half a large face into a convincing one-eyed face.
         // Only the outer screen edges may truncate a detection: overlapping
         // tiles and the overview supply complete faces at internal scan seams.
@@ -159,6 +164,95 @@ impl Detector {
             }
         }
         Ok(suppress(found))
+    }
+
+    /// Upright detectors can return one eye or a weak, almost horizontal human
+    /// guess on sideways art. Check one uncertain face per scan at two rolls.
+    /// The 320px reusable crop keeps this work bounded on the inference thread.
+    fn refine_uncertain_roll(&mut self, image: &Image<'_>, found: &mut [Face]) -> Result<()> {
+        let candidate = found
+            .iter()
+            .enumerate()
+            .filter(|(_, f)| {
+                f.eye_count == 1 || (f.eye_band == 0. && f.score < 0.85 && f.w > f.h * 0.9)
+            })
+            .max_by(|(_, a), (_, b)| a.score.total_cmp(&b.score))
+            .map(|(i, _)| i);
+        let Some(index) = candidate else {
+            return Ok(());
+        };
+        let original = &found[index];
+        let (cx, cy) = (original.x + original.w * 0.5, original.y + original.h * 0.5);
+        let side = 320usize;
+        let scale = original.w.max(original.h) * 1.7 / side as f32;
+        self.roll_pixels.resize(side * side * 4, 0);
+        let mut best: Option<Face> = None;
+        for degrees in [-90f32, 90.] {
+            let (sin, cos) = degrees.to_radians().sin_cos();
+            for y in 0..side {
+                for x in 0..side {
+                    let (u, v) = (
+                        (x as f32 + 0.5 - side as f32 * 0.5) * scale,
+                        (y as f32 + 0.5 - side as f32 * 0.5) * scale,
+                    );
+                    let (sx, sy) = (cx + u * cos - v * sin, cy + u * sin + v * cos);
+                    let target = (y * side + x) * 4;
+                    if sx >= 0. && sy >= 0. && sx < image.width as f32 && sy < image.height as f32 {
+                        let source = (sy as usize * image.width + sx as usize) * 4;
+                        self.roll_pixels[target..target + 4]
+                            .copy_from_slice(&image.pixels[source..source + 4]);
+                    } else {
+                        self.roll_pixels[target..target + 4].copy_from_slice(&[214, 214, 214, 255]);
+                    }
+                }
+            }
+            let crop = Image {
+                pixels: &self.roll_pixels,
+                width: side,
+                height: side,
+            };
+            for mut face in self.stylized.detect(
+                &crop,
+                Region {
+                    x: 0,
+                    y: 0,
+                    w: side,
+                    h: side,
+                },
+                0.35,
+            )? {
+                if face.eye_count != 2 || face.score < (original.score * 0.85).max(0.65) {
+                    continue;
+                }
+                let bar = face.bar(1., 1.);
+                if bar.angle.sin().abs() > std::f32::consts::FRAC_1_SQRT_2
+                    || (bar.x - side as f32 * 0.5).hypot(bar.y - side as f32 * 0.5)
+                        > side as f32 * 0.35
+                {
+                    continue;
+                }
+                face.eyes = face.eyes.map(|[x, y]| {
+                    let (u, v) = (
+                        (x - side as f32 * 0.5) * scale,
+                        (y - side as f32 * 0.5) * scale,
+                    );
+                    [cx + u * cos - v * sin, cy + u * sin + v * cos]
+                });
+                face.eye_band *= scale;
+                if best.as_ref().is_none_or(|prior| face.score > prior.score) {
+                    best = Some(face);
+                }
+            }
+        }
+        if let Some(refined) = best {
+            let face = &mut found[index];
+            face.eyes = refined.eyes;
+            face.eye_count = 2;
+            face.eye_band = refined.eye_band;
+            // This is a close-up landmark result, not an improved face box.
+            face.detail = face.detail.max(refined.detail);
+        }
+        Ok(())
     }
 
     pub fn detect_human(
@@ -415,6 +509,33 @@ mod tests {
             assert!(
                 (dx * cos + dy * sin).abs() <= b.w / 2. && (-dx * sin + dy * cos).abs() <= b.h / 2.
             );
+        }
+    }
+    #[test]
+    fn narrow_eye_pairs_keep_their_actual_roll() {
+        for degrees in [-85f32, -60., -35., 35., 60., 85.] {
+            let (sin, cos) = degrees.to_radians().sin_cos();
+            let face = Face {
+                x: 0.,
+                y: 0.,
+                w: 180.,
+                h: 200.,
+                eyes: [
+                    [90. - cos * 8., 80. - sin * 8.],
+                    [90. + cos * 8., 80. + sin * 8.],
+                ],
+                score: 0.95,
+                eye_count: 2,
+                detail: 180.,
+                eye_band: 20.,
+            };
+            let bar = face.bar(1., 1.);
+            assert!(
+                (bar.angle - degrees.to_radians()).abs() < 0.001,
+                "flattened {degrees} degree eye pair to {}",
+                bar.angle
+            );
+            assert!((bar.x - 90.).abs() < 0.001);
         }
     }
     #[test]

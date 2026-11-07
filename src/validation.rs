@@ -622,6 +622,115 @@ fn varied_anime_motion() -> Result<()> {
 }
 
 #[test]
+#[ignore = "requires PYRA_CORPUS, PYRA_REPORT and PYRA_RUNTIME; manually annotated anime roll sweep"]
+fn steep_anime_tilt() -> Result<()> {
+    let group =
+        image::open(PathBuf::from(std::env::var("PYRA_CORPUS")?).join("generated-group.jpg"))?
+            .to_rgb8();
+    let choices = [
+        (0, 0, [[101., 51.], [130., 75.]]),
+        (1, 0, [[61., 91.], [122., 83.]]),
+        (2, 1, [[107., 108.], [153., 109.]]),
+    ];
+    let mut detector = Detector::new(&crate::native::runtime())?;
+    let mut csv =
+        String::from("portrait,rotation_degrees,matched,covered,eye_count,angle_error_degrees\n");
+    let (mut matched_total, mut covered_total, mut paired_total) = (0, 0, 0);
+    for (index, (column, row, eyes)) in choices.into_iter().enumerate() {
+        let portrait = image::imageops::resize(
+            &image::imageops::crop_imm(&group, column * 512, row * 512, 512, 512).to_image(),
+            256,
+            256,
+            image::imageops::FilterType::Triangle,
+        );
+        for degrees in [-75f32, -60., -45., -30., 0., 30., 45., 60., 75.] {
+            let (sin, cos) = degrees.to_radians().sin_cos();
+            let mut rotated = RgbImage::from_pixel(512, 512, Rgb([214, 214, 214]));
+            for y in 0..512 {
+                for x in 0..512 {
+                    let (dx, dy) = (x as f32 - 256., y as f32 - 256.);
+                    let (sx, sy) = (dx * cos + dy * sin + 128., -dx * sin + dy * cos + 128.);
+                    if (0. ..256.).contains(&sx) && (0. ..256.).contains(&sy) {
+                        rotated.put_pixel(x, y, *portrait.get_pixel(sx as u32, sy as u32));
+                    }
+                }
+            }
+            let expected = eyes.map(|[x, y]| {
+                [
+                    256. + (x - 128.) * cos - (y - 128.) * sin,
+                    256. + (x - 128.) * sin + (y - 128.) * cos,
+                ]
+            });
+            let mut pixels = Vec::with_capacity(512 * 512 * 4);
+            for p in rotated.pixels() {
+                pixels.extend_from_slice(&[p[2], p[1], p[0], 255]);
+            }
+            let faces = detector.detect(
+                &Image {
+                    pixels: &pixels,
+                    width: 512,
+                    height: 512,
+                },
+                Region {
+                    x: 0,
+                    y: 0,
+                    w: 512,
+                    h: 512,
+                },
+                0.6,
+            )?;
+            let (matched, covered, _) = score(&faces, &[expected]);
+            let center = [
+                (expected[0][0] + expected[1][0]) * 0.5,
+                (expected[0][1] + expected[1][1]) * 0.5,
+            ];
+            let closest = faces.iter().min_by(|a, b| {
+                let distance = |face: &Face| {
+                    let bar = face.bar(1., 1.);
+                    (bar.x - center[0]).hypot(bar.y - center[1])
+                };
+                distance(a).total_cmp(&distance(b))
+            });
+            let expected_angle =
+                (expected[1][1] - expected[0][1]).atan2(expected[1][0] - expected[0][0]);
+            let (count, error) = closest.map_or((0, 90.), |face| {
+                (
+                    face.eye_count,
+                    (face.bar(1., 1.).angle - expected_angle)
+                        .cos()
+                        .abs()
+                        .clamp(0., 1.)
+                        .acos()
+                        .to_degrees(),
+                )
+            });
+            if covered == 0 {
+                println!(
+                    "tilt miss portrait={index} roll={degrees} expected={expected:?} closest={closest:?}"
+                );
+            }
+            matched_total += matched;
+            covered_total += covered;
+            paired_total += usize::from(matched > 0 && count == 2);
+            csv.push_str(&format!(
+                "{index},{degrees},{matched},{covered},{count},{error:.2}\n"
+            ));
+        }
+    }
+    let report = PathBuf::from(std::env::var("PYRA_REPORT")?);
+    std::fs::create_dir_all(&report)?;
+    std::fs::write(report.join("steep-tilt.csv"), csv)?;
+    println!(
+        "27 annotated anime rotations (-75 to +75 degrees): matched={matched_total}, eye-center coverage={covered_total}, two-eye results={paired_total}"
+    );
+    anyhow::ensure!(
+        matched_total >= 24 && covered_total >= 24,
+        "steep-roll eye coverage below regression floor"
+    );
+    Ok(())
+}
+
+#[test]
 #[ignore = "requires PYRA_PHOTOS, PYRA_REPORT, PYRA_ART_MODELS and PYRA_RUNTIME"]
 fn annotated_real_groups() -> Result<()> {
     let root = PathBuf::from(std::env::var("PYRA_PHOTOS")?);
@@ -648,7 +757,31 @@ fn annotated_real_groups() -> Result<()> {
     for (name, eyes) in expected {
         let image = image::open(root.join(&name))?.to_rgb8();
         let before = scan(&mut detector, &mut art, &image, false)?;
-        let after = scan(&mut detector, &mut art, &image, true)?;
+        // Exercise the production fusion/refinement path as well as the raw
+        // model comparison used by the image benchmark.
+        let pixels: Vec<_> = image
+            .pixels()
+            .flat_map(|p| [p[2], p[1], p[0], 255])
+            .collect();
+        let input = Image {
+            pixels: &pixels,
+            width: image.width() as usize,
+            height: image.height() as usize,
+        };
+        let mut regions = vec![Region {
+            x: 0,
+            y: 0,
+            w: input.width,
+            h: input.height,
+        }];
+        if input.width > 800 || input.height > 800 {
+            regions.extend(crate::scanning::grid(input.width, input.height, 800));
+        }
+        let mut after = Vec::new();
+        for region in regions {
+            after.extend(detector.detect(&input, region, 0.6)?);
+        }
+        let after = suppress(after);
         let a = score(&before, &eyes);
         let b = score(&after, &eyes);
         old_total += a.1;

@@ -77,6 +77,11 @@ The tray menu offers:
 Real faces use YuNet; anime and illustrated faces also use dedicated face and
 eye models. Bars follow detected eyes, including a single visible eye in a
 profile, rather than assuming the eyes occupy a fixed part of a face box.
+Distinct eye pairs retain their full tilt, even when close together. Anime eye
+association includes the whole face box, and rotated bar thickness accounts for
+both eye-box dimensions. For one uncertain face per scan, the background detector
+can check two small sideways crops to recover landmarks that upright models miss;
+this uses a reusable 320-pixel buffer and leaves the face box unchanged.
 Faces cut off by an internal scan tile are left to overlapping tiles and overview
 scans, preventing a large wallpaper face from becoming several partial tracks.
 Repeated scans preserve bar geometry on unchanged face pixels; higher-resolution
