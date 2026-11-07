@@ -49,7 +49,9 @@ Extract the ZIP and follow the quick start below.
 Windows 10 version 2004 (build 19041) or newer, or Windows 11; x64.
 
 1. Extract the entire portable package into a writable folder.
-2. Run `Pyra.exe`. Keep `onnxruntime.dll` and
+2. Double-click **Launch Pyra.cmd** (or run `Pyra.exe` directly). The launcher
+   starts Pyra in the notification area and closes its terminal automatically.
+   Keep `onnxruntime.dll` and
    `onnxruntime_providers_shared.dll` beside it.
 3. Click the lavender/black-bar icon in the Windows notification area for settings.
    Windows may put it under the notification area's overflow arrow.
