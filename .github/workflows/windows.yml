@@ -24,7 +24,7 @@ jobs:
           Expand-Archive runtime.zip runtime
           New-Item -ItemType Directory -Force dist/Pyra/licenses | Out-Null
           Copy-Item target/release/pyra.exe dist/Pyra/Pyra.exe
-          Copy-Item 'Launch Pyra.cmd' dist/Pyra/
+          Copy-Item 'Launch Pyra.cmd','Stop Pyra.cmd' dist/Pyra/
           Copy-Item runtime/onnxruntime-win-x64-1.22.0/lib/*.dll dist/Pyra/
           Copy-Item README.md,THIRD_PARTY.md dist/Pyra/
           Copy-Item LICENSE dist/Pyra/licenses/LICENSE-Pyra.txt

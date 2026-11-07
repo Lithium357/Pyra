@@ -58,7 +58,10 @@ Windows 10 version 2004 (build 19041) or newer, or Windows 11; x64.
 
 **Ctrl+Alt+B** pauses/resumes. **Ctrl+Alt+O** opens the tray menu at your cursor.
 If another app has registered those shortcuts, the tray menu still works.
-Choose **Quit Pyra** to stop it. Launching a second instance does nothing.
+Choose **Quit Pyra** to stop it normally, or double-click **Stop Pyra.cmd** to
+force-stop the tray process and its worker, including an unresponsive instance.
+The stop script also works when Pyra is already stopped. Launching a second
+instance does nothing.
 
 The tray menu offers:
 
